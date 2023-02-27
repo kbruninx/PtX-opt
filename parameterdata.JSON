@@ -1,7 +1,8 @@
 {
     "scenario": {
-        "simulation_days": 100,
-        "tc_periods": 100,
+        "name": "test",
+        "simulation_days": 50,
+        "tc_periods": 4,
         "hourly_target": 100,
         "discount_rate": 0.05
     },
