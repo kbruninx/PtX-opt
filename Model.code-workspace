@@ -1,0 +1,10 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		}
+	],
+	"settings": {
+		"julia.environmentPath": "/Users/leonard/Documents/Sia Partners/Model/PtX-opt"
+	}
+}
