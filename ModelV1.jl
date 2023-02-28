@@ -5,17 +5,17 @@ Author: Leonard Eble
 Date: 2019-01-15
 =#
 
-include("PtxOpt.jl")
-
 # Importing the necessary packages
 using JuMP
 using Gurobi
-import .PtxOpt
- 
+using PyCall
+using CSV
+using DataFrames
+using Plots
+using JSON
+using ReusePatterns
+using Statistics
 
-<<<<<<< Updated upstream
-function optimizationmodel(parameters::PtxOpt.Parameter_Data)
-=======
 # Directory
 const home_dir = @__DIR__
 
@@ -66,7 +66,6 @@ struct Timeseries_Data
     wind::Array{Float64,2}
     price_DAM::Array{Float64,2}
 end
-
 
 struct Parameter_Data
     # Parameter data structure, containing all the parameter data needed for the optimization model
@@ -234,6 +233,13 @@ function getcomponentcosts(
 end
 
     # Model calculations
+function maxcapelectrolyzer(
+    parameters::Parameter_Data
+)
+    min_capacityfactor = 0.05
+    parameters.scenario.hourly_target/parameters.components["electrolyzer"].efficiency/min_capacityfactor
+end
+
 function getelectrolyzerproduction(
     p_electrolyzer::Float64, 
     os_electrolyzer::Bool, 
@@ -289,10 +295,22 @@ function getresultsdict(m::JuMP.Model)
     )
 end
 
+"""
+    solveoptimizationmodel(
+        parameters::Parameter_Data
+    )
 
+This function takes parameter data and returns a solved model with the results for the given parameters.
 
-function optimizationmodel(parameters::Parameter_Data)
->>>>>>> Stashed changes
+# Arguments
+
+- `parameters::Parameter_Data`: Structure containing all the parameters for the optimization model
+    
+# Returns
+
+- `model::JuMP.Model`: Solved model with the results for the given parameters
+"""
+function solveoptimizationmodel(parameters::Parameter_Data)
     # Defining the model
     model = Model(Gurobi.Optimizer)
     set_time_limit_sec(model, 60)
@@ -303,13 +321,12 @@ function optimizationmodel(parameters::Parameter_Data)
     timeseries = parameters.timeseries
     electrolyzer = parameters.components["electrolyzer"]
 
-
     # Defining the variables
         # Design (POTENTIALLY ADD UPPER BOUNDS HERE)
     @variables(model, begin
         0 <= c_solar #Solar capacity
         0 <= c_wind #Wind capacity
-        0 <= c_electrolyzer #Electrolyzer capacity
+        0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
     end)
 
         # Operation
@@ -356,11 +373,7 @@ function optimizationmodel(parameters::Parameter_Data)
         model, 
         [k in 1:tc_periods, t in 1:tc_length], 
         (p_electrolyzer[k,t] <= 
-<<<<<<< Updated upstream
-        PtxOpt.lowerbound_electrolyzer(model, electrolyzer, k, t))
-=======
         upperbound_electrolyzer(model, electrolyzer, k, t))
->>>>>>> Stashed changes
     ) 
 
             # Lower bound electrolyzer power
@@ -368,7 +381,7 @@ function optimizationmodel(parameters::Parameter_Data)
         model, 
         [k in 1:tc_periods, t in 1:tc_length], 
         (p_electrolyzer[k,t] >= 
-        PtxOpt.lowerbound_electrolyzer(model, electrolyzer, k, t))
+        lowerbound_electrolyzer(model, electrolyzer, k, t))
     )
 
         # Production target
@@ -382,7 +395,7 @@ function optimizationmodel(parameters::Parameter_Data)
     @constraint(
         model, 
         [k in 1:tc_periods], 
-        (sum((PtxOpt.getnetpower(model, electrolyzer, k, t)) for t in 1:tc_length) <= 
+        (sum((getnetpower(model, electrolyzer, k, t)) for t in 1:tc_length) <= 
         0)
     )
 
@@ -390,13 +403,8 @@ function optimizationmodel(parameters::Parameter_Data)
     @objective(
         model, 
         Min, 
-<<<<<<< Updated upstream
-        (sum(PtxOpt.getcomponentcosts(parameters, (c_solar, c_wind, c_electrolyzer)) +
-        sum(timeseries.price_DAM[k,t]*(p_DAM_buy[k,t]-p_DAM_sell[k,t]) for k in 1:tc_periods, t in 1:tc_length)))
-=======
         (getinvestmentcosts(model, parameters) +
         sum(timeseries.price_DAM[k,t]*(p_DAM_buy[k,t]-p_DAM_sell[k,t]) for k in 1:tc_periods, t in 1:tc_length))
->>>>>>> Stashed changes
     )
 
     # Solving the model
@@ -405,39 +413,32 @@ function optimizationmodel(parameters::Parameter_Data)
     return model
 end
 
-# Printing the results
-function showresults(model)
+"""
+    showresults(
+        model::JuMP.Model, 
+        parameters::Parameter_Data
+    )
+
+This function takes a solved model and the parameters and prints a set of results for the optimization model.
+    It also saves the powerflow results to a csv file.
+
+# Arguments
+
+- `model::JuMP.Model`: Solved model with the results for the given parameters
+- `parameters::Parameter_Data`: Structure containing all the parameters for the optimization model
+
+# Returns
+
+- `nothing`
+"""
+function showresults(
+    model::JuMP.Model, 
+    parameters::Parameter_Data
+)
     results = getresultsdict(model)
     # Defining the most commonly used parameternames for readability
     simulation_length = parameters.scenario.simulation_length
 
-
-<<<<<<< Updated upstream
-    # Printing the results
-    println("Total costs: ", objective_value(model))
-    println("Average cost of Hydrogen: ", objective_value(model)/production_target)
-    println("Solar capacity: ", results[:c_solar])
-    println("Solar costs: ", getcomponentcosts(results[:c_solar], solar_component))
-    println("Wind capacity: ", results[:c_wind])
-    println("Wind costs: ", getcomponentcosts(results[:c_wind], wind_component))
-    println("Electrolyzer capacity: ", results[:c_electrolyzer])
-    println("Electrolyzer costs: ", getcomponentcosts(results[:c_electrolyzer], electrolyzer_component))
-    println("CAPEX costs: ", getcomponentcosts(results[:c_solar], solar_component) + getcomponentcosts(results[:c_wind], wind_component) + getcomponentcosts(results[:c_electrolyzer], electrolyzer_component))
-
-    # Preparing the data for plotting
-    p_solar = results[:c_solar]*solarcf_subset
-    p_wind = results[:c_wind]*windcf_subset
-    p_buy = reshape(results[:p_DAM_buy], simulation_length,1)
-    p_sell = reshape(results[:p_DAM_sell], simulation_length,1)
-    p_el = reshape(results[:p_electrolyzer], simulation_length,1)
-
-    # Printing profit from DAM market
-    println("Total profit power market:", sum(price_subset.*(p_sell-p_buy)))
-    
-    netmarketpowerarray = getnetpower(results[:p_DAM_buy], results[:p_DAM_sell], results[:os_electrolyzer], results[:c_electrolyzer])
-    netmarketpower = sum(netmarketpowerarray, dims=2)
-    println(netmarketpower)
-=======
     capacitycomponentpairs = zip(
         (results[:c_solar], results[:c_wind], results[:c_electrolyzer]),
         (parameters.components[component] for component in ("solar", "wind", "electrolyzer"))
@@ -464,7 +465,6 @@ function showresults(model)
     println("Total profit power market:", sum(p_DAM.*(p_sell.-p_buy)))
 
     legendfontsize = 7
->>>>>>> Stashed changes
 
     plot(range(1,simulation_length), [p_solar p_wind p_buy p_sell p_el], label=["Solar" "Wind" "Buy" "Sell" "Electrolyzer"], xlabel="Time", ylabel="Power (MW)", title="Power flow", legend=:topleft, legend_font_pointsize=legendfontsize)
     plot!(twinx(), p_DAM, color=:black, linestyle=:dash, label="Price", ylabel="Price (€/MWh)", legend=:topright, show=true, legend_font_pointsize=legendfontsize)
@@ -474,10 +474,21 @@ end
 """
     main(parameterfilename::String)
 
+This function is the main function of the optimization model. 
+    It takes a parameterfilename and solves the optimization model with the given parameters.
+
+# Arguments
+
+- `parameterfilename::String`: Name of the parameterfile, which should be a .json file
+
+# Returns
+
+- `model::JuMP.Model`: Solved model with the results for the given parameters
+
 """
 function main(parameterfilename::String)
-    parameters = PtxOpt.fetchparameterdata(parameterfilename)
-    model = optimizationmodel(parameters)
+    parameters = fetchparameterdata(parameterfilename)
+    model = solveoptimizationmodel(parameters)
     if termination_status(model) == MOI.OPTIMAL
         println("Optimal solution found.")
         showresults(model, parameters)
@@ -486,3 +497,5 @@ function main(parameterfilename::String)
     end
     return model
 end
+
+
