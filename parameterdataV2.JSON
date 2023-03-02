@@ -1,0 +1,34 @@
+{
+    "scenario": {
+        "name": "test",
+        "simulation_days": 180,
+        "tc_periods": 6,
+        "hourly_target": 100,
+        "discount_rate": 0.05
+    },
+    "components": {
+        "solar": {
+            "systemprice": 628000,
+            "fixopex": 0.02,
+            "lifetime": 30
+        },
+        "wind": {
+            "systemprice": 1325000,
+            "fixopex": 0.02,
+            "lifetime": 20
+        },
+        "electrolyzer": {
+            "systemprice": 600000,
+            "fixopex": 0.02,
+            "lifetime": 15,
+            "efficiency": 18.5,
+            "P_min": 0.1,
+            "P_standby": 0.01},
+        "storage": {
+            "systemprice": 400,
+            "fixopex": 0.02,
+            "lifetime": 15
+        }
+    },
+    "timeseriesfile": "ENTSOEdata_prelim.csv"
+}
