@@ -1,8 +1,8 @@
 {
     "scenario": {
-        "name": "test",
-        "simulation_days": 50,
-        "tc_periods": 4,
+        "name": "Example_monthlymatching",
+        "simulation_days": 180,
+        "tc_periods": 6,
         "hourly_target": 100,
         "discount_rate": 0.05
     },
@@ -10,11 +10,17 @@
         "solar": {
             "systemprice": 628000,
             "fixopex": 0.02,
-            "lifetime": 30
+            "lifetime": 30,
+            "maxcapacity": 0.5
         },
-        "wind": {
+        "wind_on": {
             "systemprice": 1325000,
             "fixopex": 0.02,
+            "lifetime": 20
+        },
+        "wind_off": {
+            "systemprice": 2840000,
+            "fixopex": 0.025,
             "lifetime": 20
         },
         "electrolyzer": {
@@ -23,7 +29,12 @@
             "lifetime": 15,
             "efficiency": 18.5,
             "P_min": 0.1,
-            "P_standby": 0.01}
+            "P_standby": 0.01},
+        "storage": {
+            "systemprice": 386,
+            "fixopex": 0.02,
+            "lifetime": 15
+        }
     },
-    "timeseriesfile": "ENTSOEdata_prelim.csv"
+    "timeseriesfile": "Timeseriesdata2021.csv"
 }

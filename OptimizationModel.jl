@@ -69,7 +69,8 @@ end
 struct Timeseries_Data
     # Timeseries data structure, containing all the timeseries data needed for the optimization model
     solar::Array{Float64,1}
-    wind::Array{Float64,1}
+    wind_on::Array{Float64,1}
+    wind_off::Array{Float64,1}
     price_DAM::Array{Float64,1}
 end
 
@@ -109,7 +110,8 @@ Base.show(io::IO, e::Electrolyzer_Data) = print(io, "Electrolyzer Data:
 
 Base.show(io::IO, t::Timeseries_Data) = print(io, "Timeseries Data:
     Solar capacity factor mean = $(mean(t.solar)),
-    Wind capacity factor mean =  $(mean(t.wind)),
+    Onshore wind capacity factor mean =  $(mean(t.wind_on)),
+    Offshore wind capacity factor mean =  $(mean(t.wind_off)),
     Price DAM mean= $(mean(t.price_DAM))"
 )
 
@@ -171,7 +173,7 @@ function fetchtimeseriesdata(
     timeseries_df = CSV.read(joinpath(home_dir, filename), DataFrame)
     return Timeseries_Data(
         (selectsubset(timeseries_df[:, category], scenario_dict["simulation_days"])
-        for category in ["Solar_profile", "Wind_profile", "Dayahead_price"])...
+        for category in ["Solar_profile", "Wind_on_profile", "Wind_off_profile", "Dayahead_price"])...
     )
 end
 
@@ -185,16 +187,6 @@ function selectsubset(
         append!(outarray, hourlyarray[ni-23:ni])
     end
     return outarray
-end
-
-function getTCsets(
-    scenario::Scenario_Data
-)   
-    simlength = scenario.simulation_length
-    tclength = scenario.tc_length
-    return (
-        [(i:(i+tclength-1)) for i in (1:tclength:simlength)]
-    )
 end
 
     #Financial calculations
@@ -212,8 +204,8 @@ function getinvestmentcosts(
 )
     sum = 0
     capacitycomponentpairs = zip(
-        (model[:c_solar], model[:c_wind], model[:c_electrolyzer], model[:c_storage]),
-        (parameters.components[component] for component in ("solar", "wind", "electrolyzer", "storage"))
+        (model[:c_solar], model[:c_wind_on], model[:c_wind_off], model[:c_electrolyzer], model[:c_storage]),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
     )
     for (capacity, component) in capacitycomponentpairs
         sum += getcomponentcosts(capacity, parameters.scenario, component)
@@ -300,6 +292,38 @@ function lowerbound_electrolyzer(
         electrolyzer.P_standby*model[:c_electrolyzer]*(1-model[:os_electrolyzer][t])
     )
 end
+
+function getenergyin(
+    model::JuMP.Model,
+    timeseries::Timeseries_Data,
+    t::Int64,
+    hourlymatching::Bool
+)
+    generation = (
+        model[:c_solar]*timeseries.solar[t] +
+        model[:c_wind_on]*timeseries.wind_on[t] +
+        model[:c_wind_off]*timeseries.wind_off[t]
+    )
+    if hourlymatching
+        return generation
+    else
+        return generation + model[:p_DAM_buy][t]
+    end
+end
+
+function getmarketvalue(
+    model::JuMP.Model,
+    timeseries::Timeseries_Data,
+    t::Int64,
+    hourlymatching::Bool
+)
+    if hourlymatching
+        return -model[:p_DAM_sell][t]*timeseries.price_DAM[t]
+    else
+        return (model[:p_DAM_buy][t]- model[:p_DAM_sell][t]) * timeseries.price_DAM[t]
+    end
+end
+
 """
     
 
@@ -328,33 +352,41 @@ This function takes parameter data and returns a solved model with the results f
 
 - `model::JuMP.Model`: Solved model with the results for the given parameters
 """
-function solveoptimizationmodel(parameters::Parameter_Data)
+function solveoptimizationmodel(
+    parameters::Parameter_Data, 
+    time_limit::Int64,
+    mip_gap::Float64
+)
     # Defining the model
     model = Model(Gurobi.Optimizer)
-    set_time_limit_sec(model, 120)
-    set_optimizer_attribute(model, "MIPgap", 0.05)
+
+    # Setting the time limit and the mip gap
+    set_time_limit_sec(model, time_limit)
+    set_optimizer_attribute(model, "MIPgap", mip_gap)
 
     # Defining the most commonly used parameternames for readability
     simulation_length = parameters.scenario.simulation_length
     tc_length = parameters.scenario.tc_length
     timeseries = parameters.timeseries
     electrolyzer = parameters.components["electrolyzer"]
+    hourlymatching = (parameters.scenario.simulation_length == parameters.scenario.tc_periods)
+    println("Hourly matching: ", hourlymatching)
 
-    #temporary variables outside json
+    #temporary variables outside JSON files, to be moved later
     S_init = 0.5
 
     # Defining the variables
-        # Design (POTENTIALLY ADD UPPER BOUNDS HERE)
+        # Design (these caps are currently arbitrary, should be added to json file)
     @variables(model, begin
         0 <= c_solar <= 50 #Solar capacity
-        0 <= c_wind <= 50#Wind capacity
+        0 <= c_wind_on <= 50 #Onshore capacity
+        0 <= c_wind_off <= 50 #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
     end)
 
         # Operation
     @variables(model, begin
-        0 <= p_DAM_buy[1:simulation_length] #Power bought from the DAM
         0 <= p_DAM_sell[1:simulation_length] #Power sold to the DAM
         0 <= p_electrolyzer[1:simulation_length] #Electrolyzer power
         os_electrolyzer[1:simulation_length], Bin #Electrolyzer on/standby status
@@ -365,45 +397,64 @@ function solveoptimizationmodel(parameters::Parameter_Data)
         0 <= h_demand[1:simulation_length] #Hydrogen output
     end)
 
+    #Currently, it is really slow for hourly simulations, this is a temporary fix, where buying is excluded for hourly
+    if !(hourlymatching)
+
+            # Power bought from the DAM
+        @variable(
+            model,
+            0 <= p_DAM_buy[1:simulation_length]
+        )
+        
+            # Prevents buying and selling at the same time, speeding up model
+        @constraint(
+            model,
+            [t in 1:simulation_length],
+            p_DAM_buy[t]*p_DAM_sell[t] == 0
+        )
+    
+            # Upper bound power bought from the DAM, which should never exceed the max rated power of the electrolyzer
+        @constraint(
+            model, 
+            [t in 1:simulation_length], 
+            p_DAM_buy[t] <= c_electrolyzer
+        )
+
+            #Temporal correlation constraint
+        @constraint(
+            model, 
+            [k in (1:tc_length:simulation_length)], 
+            (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+tc_length-1))) <= 
+            0)
+        )
+    end
+
     # Defining the constraints
         # Number of upper bounds on variables that dramatically increase the model speed
             # Upper bound electrolyzer capacity, which should never exceed the max rated power of the RES
     @constraint(
-        model,
-        [t in 1:simulation_length],
-        p_DAM_buy[t]*p_DAM_sell[t] == 0
-    )
-
-    @constraint(
         model, 
-        (c_electrolyzer <= (c_wind+c_solar))
-    )
-
-            # Upper bound power bought from the DAM, which should never exceed the max rated power of the electrolyzer
-    @constraint(
-        model, 
-        [t in 1:simulation_length], 
-        p_DAM_buy[t] <= c_electrolyzer
+        (c_electrolyzer <= (c_wind_on+c_wind_off+c_solar))
     )
     
             # Upper bound power sold to the DAM, which could never exceed the max rated power of the RES
     @constraint(
         model, 
         [t in 1:simulation_length],
-        p_DAM_sell[t] <= (c_wind+c_solar)
+        p_DAM_sell[t] <= (c_wind_on+c_wind_off+c_solar)
     ) 
 
             # Upper bound electrolyzer hydrogen storage input, which should never exceed the max rated power of the electrolyzer
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_storage_in[t] <= 10000
+        h_storage_in[t] <= parameters.scenario.hourly_target*5 #temporary fix, should be replaced by c_compressor or something of the sort
     )
 
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_storage_out[t] <= 10000
+        h_storage_out[t] <= parameters.scenario.hourly_target*5
     )
 
         # Physical constraints
@@ -412,7 +463,7 @@ function solveoptimizationmodel(parameters::Parameter_Data)
         model, 
         [t in 1:simulation_length], 
         (p_electrolyzer[t] + p_DAM_sell[t] == 
-        c_solar*timeseries.solar[t] + c_wind*timeseries.wind[t]+ p_DAM_buy[t])
+        getenergyin(model, timeseries, t, hourlymatching))
     )
 
             # Upper bound electrolyzer power
@@ -464,28 +515,21 @@ function solveoptimizationmodel(parameters::Parameter_Data)
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_demand[t] >= parameters.scenario.hourly_target
+        h_demand[t] >= 0.8*parameters.scenario.hourly_target
     )
         # Production target
     @constraint(
         model, 
         (sum(h_demand[t] for t in 1:simulation_length) >=
         (parameters.scenario.production_target+S_init*c_storage))
-    )
-
-    @constraint(
-        model, 
-        [k in (1:tc_length:simulation_length)], 
-        (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+tc_length-1))) <= 
-        0)
-    )
+    ) 
 
     # Defining the objective function
     @objective(
         model, 
         Min, 
         (getinvestmentcosts(model, parameters) +
-        sum(timeseries.price_DAM[t]*(p_DAM_buy[t]-p_DAM_sell[t]) for t in 1:simulation_length))
+        sum(getmarketvalue(model, timeseries, t, hourlymatching) for t in 1:simulation_length))
     )
 
     # Solving the model
@@ -495,13 +539,13 @@ function solveoptimizationmodel(parameters::Parameter_Data)
 end
 
 """
-    showresults(
+    getresults(
         model::JuMP.Model, 
-        parameters::Parameter_Data
+        parameters::Parameter_Data,
+        verbose::Bool
     )
 
-This function takes a solved model and the parameters and prints a set of results for the optimization model.
-    It also saves the powerflow results to a csv file.
+This function returns the results of the optimization model.
 
 # Arguments
 
@@ -510,51 +554,136 @@ This function takes a solved model and the parameters and prints a set of result
 
 # Returns
 
-- `nothing`
+- `var_data::Dict{Symbol,Array{Float64,1}}`: Dictionary containing the results of the optimization model
 """
-function showresults(
+function getresults(
     model::JuMP.Model, 
-    parameters::Parameter_Data
+    parameters::Parameter_Data,
+    verbose::Bool
 )
-    results = getresultsdict(model)
+    var_data = getresultsdict(model)
     # Defining the most commonly used parameternames for readability
     simulation_length = parameters.scenario.simulation_length
 
     capacitycomponentpairs = zip(
-        (results[:c_solar], results[:c_wind], results[:c_electrolyzer], results[:c_storage]),
-        (parameters.components[component] for component in ("solar", "wind", "electrolyzer", "storage"))
+        (var_data[:c_solar], var_data[:c_wind_on], var_data[:c_wind_off], var_data[:c_electrolyzer], var_data[:c_storage]),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
     )
 
-    # Printing the results
-    println("Total costs: ", objective_value(model))
-    println("Average cost of Hydrogen: ", objective_value(model)/parameters.scenario.production_target)
-    
-    componentcosts = Dict()
+    # Preparing the data for plotting
+    p_solar = parameters.timeseries.solar*var_data[:c_solar]
+    p_wind_on = parameters.timeseries.wind_on*var_data[:c_wind_on]
+    p_wind_off = parameters.timeseries.wind_off*var_data[:c_wind_off]
+    p_DAM = parameters.timeseries.price_DAM
+    p_DAM_buy = 0
+    p_DAM_sell = var_data[:p_DAM_sell]
+
+    outcome_data = DataFrame(name = String[], capacity= Any[], cost = Any[])
+
+    push!(outcome_data, ("Total costs", missing, objective_value(model)))
+    push!(outcome_data, ("Average cost of Hydrogen", missing, objective_value(model)/parameters.scenario.production_target))
+    push!(outcome_data, ("Electrolyzer capacity factor", mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), missing))
     for (capacity, component) in capacitycomponentpairs
-        componentcosts[name(component)] = getcomponentcosts(capacity, parameters.scenario, component)
-        println("$(name(component)) capacity: ", capacity)
-        println("$(name(component)) costs: ", componentcosts[name(component)])
+        push!(outcome_data, (name(component), capacity, getcomponentcosts(capacity, parameters.scenario, component)))
+    end
+    push!(outcome_data, ("Total profit power market", missing, sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))))
+
+    # Printing the results if verbose
+    if verbose
+        print(outcome_data)
     end
 
-    # Preparing the data for plotting
-    p_solar = parameters.timeseries.solar*results[:c_solar]
-    p_wind = parameters.timeseries.wind*results[:c_wind]
-    println("LCOE is: ", (sum(p_solar.+p_wind)/(componentcosts["solar"]+componentcosts["wind"])))
-    powerflow = [p_solar, p_wind, results[:p_DAM_buy], results[:p_DAM_sell], results[:p_electrolyzer]]
-    hydrogenflow = [results[:h_electrolyzer], results[:h_storage_in], results[:h_storage_out], results[:h_demand]]
-    dfh = DataFrame(hydrogenflow, :auto)
-    println(first(dfh, 5))
-    p_DAM = parameters.timeseries.price_DAM
-    # Printing profit from DAM market
-    println("Total profit power market:", sum(p_DAM.*(results[:p_DAM_sell].-results[:p_DAM_buy])))
+    legendfontsize = 3
 
-    legendfontsize = 7
+    # Collecting all the plotted data
+    powerlabels = ["Solar", "Wind (onshore)", "Wind (offshore)", "Sell", "Electrolyzer"]
+    powerflow = [p_solar, p_wind_on, p_wind_off, var_data[:p_DAM_sell], var_data[:p_electrolyzer]]
+    hydrogenflow = [var_data[:h_electrolyzer], var_data[:h_storage_in], var_data[:h_storage_out], var_data[:h_demand]]
 
-    plot(range(1,simulation_length), powerflow, label=["Solar" "Wind" "Buy" "Sell" "Electrolyzer"], xlabel="Time", ylabel="Power (MW)", title="Power flow", legend=:topleft, legend_font_pointsize=legendfontsize)
-    plot!(twinx(), p_DAM, color=:black, linestyle=:dash, label="Price", ylabel="Price (€/MWh)", legend=:topright, show=true, legend_font_pointsize=legendfontsize)
-    savefig("powerflow_$(parameters.scenario.name).svg")
-    plot(range(1, simulation_length), hydrogenflow, label=["Electrolyzer" "Storage in" "Storage out" "Demand"], xlabel="Time", ylabel="Hydrogen (kg)", title="Hydrogen flow", legend=:topleft, legend_font_pointsize=legendfontsize)
-    savefig("hydrogenflow_$(parameters.scenario.name).svg")
+    if haskey(var_data, :p_DAM_buy)
+        println("Including buy from DAM market")
+        p_DAM_buy = var_data[:p_DAM_buy]
+        insert!(powerlabels, 4, "Buy")
+        insert!(powerflow, 4, p_DAM_buy)
+    end
+
+    #transforms labels back into matrix, which is needed for plotting
+    powerlabels = permutedims(powerlabels)
+
+    # Plotting the results and adding them to the plot dict
+    powerplot = plot(
+        range(1,simulation_length), powerflow, 
+        label=powerlabels, 
+        xlabel="Time", ylabel="Power (MW)", title="Power flow", 
+        legend=:topleft, legend_font_pointsize=legendfontsize)
+    # Plots the price of the DAM market on a second y-axis
+    powerplot = plot!(
+        twinx(), p_DAM, color=:black, linestyle=:dash, 
+        label="Price", ylabel="Price (€/MWh)", legend=:topright, 
+        legend_font_pointsize=legendfontsize)
+    
+    
+    hydrogenplot = plot(
+        range(1, simulation_length), hydrogenflow, 
+        label=["Electrolyzer" "Storage in" "Storage out" "Demand"], 
+        xlabel="Time", ylabel="Hydrogen (kg)", title="Hydrogen flow", legend=:topleft, 
+        legend_font_pointsize=legendfontsize)
+    # Plots the storage SOC on a second y-axis
+    hydrogenplot = plot!(
+        twinx(), var_data[:h_storage_soc]./var_data[:c_storage], color=:black, linestyle=:dash, 
+        label="Storage SOC", ylabel="Storage SOC (%)", legend=:topright, 
+        legend_font_pointsize=legendfontsize)
+    plots = Dict("powerflow" => powerplot, "hydrogenflow" => hydrogenplot)
+
+    #Plot subsets if simulation is long
+    if simulation_length >= 24*14
+        subsetsize = 24*7
+        subsetpowerflow = map(x->x[1:subsetsize], powerflow)
+        subsethydrogenflow = map(x->x[1:subsetsize], hydrogenflow)
+
+        sub_powerplot = plot(
+            range(1, subsetsize), subsetpowerflow, 
+            label=powerlabels, 
+            xlabel="Time", ylabel="Power (MW)", title="Power flow", 
+            legend=:topleft, legend_font_pointsize=legendfontsize)
+        sub_powerplot = plot!(
+            twinx(), p_DAM[1:subsetsize], color=:black, 
+            linestyle=:dash, label="Price", ylabel="Price (€/MWh)", 
+            legend=:topright, legend_font_pointsize=legendfontsize)
+
+        sub_hydrogenplot = plot(
+            range(1, subsetsize), subsethydrogenflow, 
+            label=["Electrolyzer" "Storage in" "Storage out" "Demand"], 
+            xlabel="Time", ylabel="Hydrogen (kg)", 
+            title="Hydrogen flow", legend=:topleft, 
+            legend_font_pointsize=legendfontsize)
+        sub_hydrogenplot = plot!(
+            twinx(), var_data[:h_storage_soc][1:subsetsize]./var_data[:c_storage], 
+            color=:black, linestyle=:dash, label="Storage SOC", 
+            ylabel="Storage SOC (%)", legend=:topright, 
+            legend_font_pointsize=legendfontsize)
+        subplots = Dict("powerflow(subplot)" => sub_powerplot, "hydrogenflow(subplot)" => sub_hydrogenplot)
+        plots = merge(plots, subplots)
+    end
+
+    return Dict("data" => outcome_data, "figures" => plots)
+end
+
+function saveresults(
+    results::Dict{String, Any},
+    parameters::Parameter_Data,
+    savepath::String,
+    savecsv::Bool,
+    savefigs::Bool
+)
+    if savecsv
+        CSV.write("$(savepath)/variabledata_$(parameters.scenario.name).csv", results["data"])
+    end
+    if savefigs
+        for (k,v) in results["figures"]
+            savefig(v, "$(savepath)/$(k)_$(parameters.scenario.name).svg")
+        end
+    end
 end
 
 """
@@ -572,16 +701,24 @@ This function is the main function of the optimization model.
 - `model::JuMP.Model`: Solved model with the results for the given parameters
 
 """
-function main(parameterfilename::String)
+function main(
+    parameterfilename::String, 
+    verbose::Bool=true,
+    savepath::String="$(home_dir)/Figures",
+    savefigs::Bool=true,
+    savecsv::Bool=true
+)
     parameters = fetchparameterdata(parameterfilename)
-    model = solveoptimizationmodel(parameters)
+    if verbose
+        println("Parameters: ", parameters)
+    end
+    model = solveoptimizationmodel(parameters, 240, 0.05)
     if termination_status(model) == MOI.OPTIMAL
         println("Optimal solution found.")
-        showresults(model, parameters)
+        results = getresults(model, parameters, verbose)
+        saveresults(results, parameters, savepath, savefigs, savecsv)
     else
         throw(ErrorException("Optimal solution not found."))
     end
-    return model
+    return results
 end
-
-
