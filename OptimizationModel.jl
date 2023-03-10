@@ -31,14 +31,17 @@ struct Scenario_Data
     # Timeframe
     simulation_days::Int64
     simulation_length::Int64 # length in hourly timesteps
-    tc_periods::Int64 #number of temporal correlation periods
-    tc_length::Int64 #number of hours per temporal correlation period
     # Financial parameters
     discount_rate::Float64
     timefactor::Float64 # Annual to simulation length conversion factor
     # Hydrogen target
     hourly_target::Float64 # kg/h of hydrogen production
-    production_target::Float64 # total kg of hydrogen production
+    production_target::Float64 # kg of hydrogen production
+    etc_periods::Int64 #number of temporal correlation periods
+    etc_length::Int64 #number of hours per electricity temporal correlation period
+    htc_periods::Int64 #number of hydrogen temporal correlation periods
+    htc_length::Int64 #number of hours per hyrdogen temporal correlation period
+    flexrange::Float64 #flexibility range in % of the hourly target
 end
 
 struct Component_Data
@@ -66,6 +69,17 @@ end
 #Forwards function calls to the component_data field for the Electrolyzer_Data structure
 @forward((Electrolyzer_Data, :component_data), Component_Data)
 
+struct Storage_Data
+    # Storage data structure, containing additional storage data needed for the optimization model
+    component_data::Component_Data
+    # Additional storage parameters
+    efficiency::Float64     # kgout/kgin
+    soc_init::Float64       # %
+end
+
+#Forwards function calls to the component_data field for the Storage_Data structure
+@forward((Storage_Data, :component_data), Component_Data)
+
 struct Timeseries_Data
     # Timeseries data structure, containing all the timeseries data needed for the optimization model
     solar::Array{Float64,1}
@@ -77,7 +91,7 @@ end
 struct Parameter_Data
     # Parameter data structure, containing all the parameter data needed for the optimization model
     scenario::Scenario_Data
-    components::Dict{String, Union{Component_Data, Electrolyzer_Data}}
+    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data}}
     timeseries::Timeseries_Data
 end
 
@@ -86,12 +100,15 @@ Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Name = $(s.name),
     Simulation days = $(s.simulation_days),
     Simulation length = $(s.simulation_length),
-    Temporal Correlation periods = $(s.tc_periods),
-    Temporal Correlation length = $(s.tc_length),
     Discount rate = $(s.discount_rate),
     Timefactor = $(s.timefactor),
     Hourly production target = $(s.hourly_target),
-    Annual production target = $(s.production_target)" 
+    Total production target = $(s.production_target),
+    Electrical Temporal Correlation periods = $(s.etc_periods),
+    Electrical Temporal Correlation length = $(s.etc_length),
+    Hydrogen Temporal Correlation periods = $(s.htc_periods),
+    Hydrogen Temporal Correlation length = $(s.htc_length),
+    Flexibility range = $(s.flexrange)"
 )
 
 Base.show(io::IO, c::Component_Data) = print(io, "Component Data:
@@ -106,6 +123,12 @@ Base.show(io::IO, e::Electrolyzer_Data) = print(io, "Electrolyzer Data:
     Efficiency = $(e.efficiency),
     Minimal Power = $(e.P_min),
     Standby Power = $(e.P_standby)"
+)
+
+Base.show(io::IO, s::Storage_Data) = print(io, "Storage Data:
+    $(s.component_data),
+    Efficiency = $(s.efficiency),
+    Initial State of Charge = $(s.soc_init)"
 )
 
 Base.show(io::IO, t::Timeseries_Data) = print(io, "Timeseries Data:
@@ -137,12 +160,15 @@ function fetchscenariodata(dict)
         dict["name"],
         dict["simulation_days"],
         dict["simulation_days"]*24,
-        dict["tc_periods"],
-        dict["simulation_days"]*24/dict["tc_periods"],
         dict["discount_rate"],
         dict["simulation_days"]*24/(365*24),
         dict["hourly_target"],
-        dict["hourly_target"]*dict["simulation_days"]*24
+        dict["hourly_target"]*dict["simulation_days"]*24,
+        dict["etc_periods"],
+        dict["simulation_days"]*24/dict["etc_periods"],
+        dict["htc_periods"],
+        dict["simulation_days"]*24/dict["htc_periods"],
+        dict["flexrange"]
     )
 end
 
@@ -161,6 +187,11 @@ function fetchcomponentdata(dict)
         dict["electrolyzer"]["efficiency"],
         dict["electrolyzer"]["P_min"],
         dict["electrolyzer"]["P_standby"] 
+    )
+    out["storage"] = Storage_Data(
+        out["storage"],
+        dict["storage"]["efficiency"],
+        dict["storage"]["soc_init"]
     )
     return out
 end
@@ -230,7 +261,7 @@ end
 function maxcapelectrolyzer(
     parameters::Parameter_Data
 )
-    min_capacityfactor = 0.05
+    min_capacityfactor = 0.05 #REVIEW this value
     return(
         parameters.scenario.hourly_target/parameters.components["electrolyzer"].efficiency/min_capacityfactor
     )
@@ -239,7 +270,7 @@ end
 function maxcapstorage(
     parameters::Parameter_Data
 )
-    max_storageoftotal = 0.5
+    max_storageoftotal = 0.5 #REVIEW this value
     return(
         max_storageoftotal*parameters.scenario.production_target
     )
@@ -363,24 +394,26 @@ function solveoptimizationmodel(
     # Setting the time limit and the mip gap
     set_time_limit_sec(model, time_limit)
     set_optimizer_attribute(model, "MIPgap", mip_gap)
+    set_optimizer_attribute(model, "DualReductions", 0)
 
     # Defining the most commonly used parameternames for readability
     simulation_length = parameters.scenario.simulation_length
-    tc_length = parameters.scenario.tc_length
+    hourly_target = parameters.scenario.hourly_target
+    etc_length = parameters.scenario.etc_length
+    htc_length = parameters.scenario.htc_length
+    flexrange = parameters.scenario.flexrange
     timeseries = parameters.timeseries
     electrolyzer = parameters.components["electrolyzer"]
-    hourlymatching = (parameters.scenario.simulation_length == parameters.scenario.tc_periods)
+    storage = parameters.components["storage"]
+    hourlymatching = (parameters.scenario.simulation_length == parameters.scenario.etc_periods)
     println("Hourly matching: ", hourlymatching)
-
-    #temporary variables outside JSON files, to be moved later
-    S_init = 0.5
 
     # Defining the variables
         # Design (these caps are currently arbitrary, should be added to json file)
     @variables(model, begin
-        0 <= c_solar <= 50 #Solar capacity
-        0 <= c_wind_on <= 50 #Onshore capacity
-        0 <= c_wind_off <= 50 #Offshore capacity
+        0 <= c_solar <= 100 #Solar capacity
+        0 <= c_wind_on <= 100 #Onshore capacity
+        0 <= c_wind_off <= 100 #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
     end)
@@ -423,8 +456,8 @@ function solveoptimizationmodel(
             #Temporal correlation constraint
         @constraint(
             model, 
-            [k in (1:tc_length:simulation_length)], 
-            (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+tc_length-1))) <= 
+            [k in (1:etc_length:simulation_length)], 
+            (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+etc_length-1))) <= 
             0)
         )
     end
@@ -448,13 +481,13 @@ function solveoptimizationmodel(
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_storage_in[t] <= parameters.scenario.hourly_target*5 #temporary fix, should be replaced by c_compressor or something of the sort
+        h_storage_in[t] <= hourly_target*5 #temporary fix, should be replaced by c_compressor or something of the sort
     )
 
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_storage_out[t] <= parameters.scenario.hourly_target*5
+        h_storage_out[t] <= hourly_target*5
     )
 
         # Physical constraints
@@ -488,41 +521,54 @@ function solveoptimizationmodel(
         [t in 1:simulation_length],
         (h_electrolyzer[t] == getelectrolyzerproduction(model, electrolyzer, t))
     )
-    # Hydrogen storage capacity
+        
+        # Hydrogen storage capacity
     @constraint(
         model,
         [t in 1:simulation_length],
         (h_storage_soc[t] <= c_storage)
     )
-    # Hydrogen output
-    @constraint(
-        model,
-        [t in 1:simulation_length],
-        (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
-    )
+    
         # Hydrogen storage initialization
     @constraint(
         model,
-        (h_storage_soc[1] == S_init*c_storage + h_storage_in[1]*0.95 - h_storage_out[1])
+        (h_storage_soc[1] == storage.soc_init*c_storage + h_storage_in[1]*storage.efficiency - h_storage_out[1])
     )
+    
         # Electrolyzer hydrogen storage state of charge
     @constraint(
         model,
         [t in 2:simulation_length],
-        (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t]*0.95 - h_storage_out[t])
+        (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t]*storage.efficiency - h_storage_out[t])
     )
-        # Minimal hourly production
+
+        # Hydrogen storage final state of charge equal to initial state of charge
+    @constraint(
+        model,
+        h_storage_soc[1] == h_storage_soc[simulation_length]
+    )
+   
+        # Hydrogen output
     @constraint(
         model,
         [t in 1:simulation_length],
-        h_demand[t] >= 0.8*parameters.scenario.hourly_target
+        (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
+    )  
+
+        # Hourly flexibility constraint
+    @constraint(
+        model,
+        [t in 1:simulation_length],
+        (1-flexrange)*hourly_target <= h_demand[t] <= (1+flexrange)*hourly_target
     )
-        # Production target
+
+        # Hydrogen temporal correlation constraint
     @constraint(
         model, 
-        (sum(h_demand[t] for t in 1:simulation_length) >=
-        (parameters.scenario.production_target+S_init*c_storage))
-    ) 
+        [h in (1:htc_length:simulation_length)], 
+        (sum(h_demand[t] for t in (h:(h+htc_length-1))) == 
+        htc_length*hourly_target)
+    )
 
     # Defining the objective function
     @objective(
@@ -554,7 +600,7 @@ This function returns the results of the optimization model.
 
 # Returns
 
-- `var_data::Dict{Symbol,Array{Float64,1}}`: Dictionary containing the results of the optimization model
+- `var_data::Dict{String,Any}`: Dictionary containing the results of the optimization model (dataframe and figures)
 """
 function getresults(
     model::JuMP.Model, 
@@ -590,9 +636,10 @@ function getresults(
 
     # Printing the results if verbose
     if verbose
-        print(outcome_data)
+        println(outcome_data)
     end
 
+    #Decreasing font size to improve figure clarity
     legendfontsize = 3
 
     # Collecting all the plotted data
@@ -600,6 +647,7 @@ function getresults(
     powerflow = [p_solar, p_wind_on, p_wind_off, var_data[:p_DAM_sell], var_data[:p_electrolyzer]]
     hydrogenflow = [var_data[:h_electrolyzer], var_data[:h_storage_in], var_data[:h_storage_out], var_data[:h_demand]]
 
+    # Checks if the current model is not hourly, which means it has buying data for the DAM. Then adds the data and label for plotting.
     if haskey(var_data, :p_DAM_buy)
         println("Including buy from DAM market")
         p_DAM_buy = var_data[:p_DAM_buy]
@@ -610,7 +658,7 @@ function getresults(
     #transforms labels back into matrix, which is needed for plotting
     powerlabels = permutedims(powerlabels)
 
-    # Plotting the results and adding them to the plot dict
+    # Plotting the power flows over the entire period
     powerplot = plot(
         range(1,simulation_length), powerflow, 
         label=powerlabels, 
@@ -622,7 +670,7 @@ function getresults(
         label="Price", ylabel="Price (€/MWh)", legend=:topright, 
         legend_font_pointsize=legendfontsize)
     
-    
+    # Plotting the hydrogen flows over the entire period
     hydrogenplot = plot(
         range(1, simulation_length), hydrogenflow, 
         label=["Electrolyzer" "Storage in" "Storage out" "Demand"], 
@@ -635,7 +683,7 @@ function getresults(
         legend_font_pointsize=legendfontsize)
     plots = Dict("powerflow" => powerplot, "hydrogenflow" => hydrogenplot)
 
-    #Plot subsets if simulation is long
+    #Plot subsets if simulation is long, identical to plots above, but over shorter period
     if simulation_length >= 24*14
         subsetsize = 24*7
         subsetpowerflow = map(x->x[1:subsetsize], powerflow)
@@ -698,13 +746,13 @@ This function is the main function of the optimization model.
 
 # Returns
 
-- `model::JuMP.Model`: Solved model with the results for the given parameters
+- `results::Dict{String, Any}`: Dictionary containing the results of the optimization model
 
 """
 function main(
     parameterfilename::String, 
     verbose::Bool=true,
-    savepath::String="$(home_dir)/Figures",
+    savepath::String="$(home_dir)/Results",
     savefigs::Bool=true,
     savecsv::Bool=true
 )

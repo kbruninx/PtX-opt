@@ -1,9 +1,11 @@
 {
     "scenario": {
-        "name": "Example_monthlymatching",
+        "name": "Example_hourlymatching_inflex",
         "simulation_days": 180,
-        "tc_periods": 6,
         "hourly_target": 100,
+        "etc_periods": 4320,
+        "htc_periods": 6,
+        "flexrange": 0.6,
         "discount_rate": 0.05
     },
     "components": {
@@ -33,7 +35,9 @@
         "storage": {
             "systemprice": 386,
             "fixopex": 0.02,
-            "lifetime": 15
+            "lifetime": 15,
+            "efficiency": 0.98,
+            "soc_init": 0.5
         }
     },
     "timeseriesfile": "Timeseriesdata2021.csv"
