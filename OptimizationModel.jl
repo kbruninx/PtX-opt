@@ -17,10 +17,11 @@ using Gurobi
 using PyCall
 using CSV
 using DataFrames
-using Plots
 using JSON
 using ReusePatterns
 using Statistics
+using CairoMakie
+CairoMakie.activate!(type = "svg")
 
 # Directory
 const home_dir = @__DIR__
@@ -33,13 +34,12 @@ struct Scenario_Data
     simulation_length::Int64 # length in hourly timesteps
     # Financial parameters
     discount_rate::Float64
+    lambda_TSO::Float64 # TSO penalty factor
     timefactor::Float64 # Annual to simulation length conversion factor
     # Hydrogen target
     hourly_target::Float64 # kg/h of hydrogen production
     production_target::Float64 # kg of hydrogen production
-    etc_periods::Int64 #number of temporal correlation periods
     etc_length::Int64 #number of hours per electricity temporal correlation period
-    htc_periods::Int64 #number of hydrogen temporal correlation periods
     htc_length::Int64 #number of hours per hyrdogen temporal correlation period
     flexrange::Float64 #flexibility range in % of the hourly target
 end
@@ -101,12 +101,11 @@ Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Simulation days = $(s.simulation_days),
     Simulation length = $(s.simulation_length),
     Discount rate = $(s.discount_rate),
+    TSO tariff = $(s.lambda_TSO),
     Timefactor = $(s.timefactor),
     Hourly production target = $(s.hourly_target),
     Total production target = $(s.production_target),
-    Electrical Temporal Correlation periods = $(s.etc_periods),
     Electrical Temporal Correlation length = $(s.etc_length),
-    Hydrogen Temporal Correlation periods = $(s.htc_periods),
     Hydrogen Temporal Correlation length = $(s.htc_length),
     Flexibility range = $(s.flexrange)"
 )
@@ -148,31 +147,88 @@ Base.show(io::IO, p::Parameter_Data) = print(io, "Parameter Data:
     #Fetching data
 function fetchparameterdata(parameterfile)
     d = JSON.parsefile(parameterfile)
-    return Parameter_Data(
-        fetchscenariodata(d["scenario"]),
-        fetchcomponentdata(d["components"]),
-        fetchtimeseriesdata(d["timeseriesfile"], d["scenario"])
-    )
+    scenarios = combinescenarios(d["scenarios"])
+    components = componentsfromdict(d["components"])
+    timeseries = timeseriesfromdict(d["timeseriesfile"], d["scenarios"])
+
+    # If there is only one scenario, return a Parameter_Data
+    if scenarios isa Scenario_Data
+        return Parameter_Data(
+                scenarios,
+                components,
+                timeseries
+        )
+    # If there are multiple scenarios, return a DataFrame with a column of Parameter_Data
+    elseif scenarios isa DataFrame
+        parameterdata = select(scenarios, Not("Scenario"))
+        parameterdata[:, "Parameters"] = [Parameter_Data(
+            scenario,
+            components,
+            timeseries
+            ) for scenario in scenarios[:, "Scenario"]]
+        return parameterdata
+    else
+        error("Scenario data is neither a Scenario_Data nor a DataFrame")
+    end
 end
 
-function fetchscenariodata(dict)
+function permutatedict(
+    dict::Dict{String, Any}
+)
+    #Checking for variables of interest (arrays)
+    varsofinterest = [key for (key, value) in dict if value isa Array]
+    #If there are none, return the scenario
+    if varsofinterest == []
+        return scenariofromdict(dict), varsofinterest
+    end
+    #Take out the name of scenario and permutate the rest
+    name = pop!(dict, "name")
+    permutations = [Dict{String,Any}(zip(keys(dict), p)) for p in Iterators.product(values(dict)...)]
+    #Put the name back in
+    for p in permutations
+        p["name"] = name
+    end
+
+    return permutations, varsofinterest
+end
+
+function combinescenarios(
+    scenariodict::Dict{String, Any}
+    )
+    #Get the scenarios and the variables of interest
+    scenarios, varsofinterest = permutatedict(scenariodict)
+
+    #If there are no variables of interest, return a Scenario_Data
+    if varsofinterest == []
+        return scenarios
+    end
+
+    #Initialize the DataFrame
+    df = DataFrame([columnname => [] for columnname in [varsofinterest..., "Scenario"]])
+    #Fill the DataFrame
+    for p in scenarios
+        push!(df, ([p[var] for var in varsofinterest]..., scenariofromdict(p)))
+    end
+    return df
+end
+
+function scenariofromdict(dict)
     return Scenario_Data(
         dict["name"],
         dict["simulation_days"],
         dict["simulation_days"]*24,
         dict["discount_rate"],
+        dict["lambda_TSO"],
         dict["simulation_days"]*24/(365*24),
         dict["hourly_target"],
         dict["hourly_target"]*dict["simulation_days"]*24,
-        dict["etc_periods"],
-        dict["simulation_days"]*24/dict["etc_periods"],
-        dict["htc_periods"],
-        dict["simulation_days"]*24/dict["htc_periods"],
+        dict["etc_length"],
+        dict["htc_length"],
         dict["flexrange"]
     )
 end
 
-function fetchcomponentdata(dict)
+function componentsfromdict(dict)
     out = Dict()
     for (k, v) in dict
         out[k] = Component_Data(
@@ -197,7 +253,7 @@ function fetchcomponentdata(dict)
 end
 
 # Timeseries manipulation
-function fetchtimeseriesdata(
+function timeseriesfromdict(
     filename::String, 
     scenario_dict::Dict
 )
@@ -327,32 +383,23 @@ end
 function getenergyin(
     model::JuMP.Model,
     timeseries::Timeseries_Data,
-    t::Int64,
-    hourlymatching::Bool
+    t::Int64
 )
     generation = (
         model[:c_solar]*timeseries.solar[t] +
         model[:c_wind_on]*timeseries.wind_on[t] +
         model[:c_wind_off]*timeseries.wind_off[t]
     )
-    if hourlymatching
-        return generation
-    else
-        return generation + model[:p_DAM_buy][t]
-    end
+    return generation + model[:p_DAM_buy][t]
 end
 
 function getmarketvalue(
     model::JuMP.Model,
     timeseries::Timeseries_Data,
-    t::Int64,
-    hourlymatching::Bool
+    lambda_TSO::Float64,
+    t::Int64
 )
-    if hourlymatching
-        return -model[:p_DAM_sell][t]*timeseries.price_DAM[t]
-    else
-        return (model[:p_DAM_buy][t]- model[:p_DAM_sell][t]) * timeseries.price_DAM[t]
-    end
+    return model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) - model[:p_DAM_sell][t] * timeseries.price_DAM[t]
 end
 
 """
@@ -403,24 +450,37 @@ function solveoptimizationmodel(
     htc_length = parameters.scenario.htc_length
     flexrange = parameters.scenario.flexrange
     timeseries = parameters.timeseries
+    lambda_TSO = parameters.scenario.lambda_TSO
     electrolyzer = parameters.components["electrolyzer"]
     storage = parameters.components["storage"]
-    hourlymatching = (parameters.scenario.simulation_length == parameters.scenario.etc_periods)
+    
+    hourlymatching = (etc_length==1)
     println("Hourly matching: ", hourlymatching)
+    maxcapgenerators = 100
 
     # Defining the variables
         # Design (these caps are currently arbitrary, should be added to json file)
     @variables(model, begin
-        0 <= c_solar <= 100 #Solar capacity
-        0 <= c_wind_on <= 100 #Onshore capacity
-        0 <= c_wind_off <= 100 #Offshore capacity
+        0 <= c_solar <= maxcapgenerators #Solar capacity
+        0 <= c_wind_on <= maxcapgenerators #Onshore capacity
+        0 <= c_wind_off <= maxcapgenerators #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
     end)
 
+    # Optional constraints for fixed capacities
+    # @constraints(model, begin
+    #     c_solar == 37.4322
+    #     c_wind_on == 15.0799
+    #     c_wind_off == 0
+    #     c_electrolyzer == 6.00945
+    #     c_storage == 2918.96
+    # end)
+
         # Operation
     @variables(model, begin
         0 <= p_DAM_sell[1:simulation_length] #Power sold to the DAM
+        0 <= p_DAM_buy[1:simulation_length] # Power bought from the DAM
         0 <= p_electrolyzer[1:simulation_length] #Electrolyzer power
         os_electrolyzer[1:simulation_length], Bin #Electrolyzer on/standby status
         0 <= h_electrolyzer[1:simulation_length] #Electrolyzer hydrogen production
@@ -430,38 +490,35 @@ function solveoptimizationmodel(
         0 <= h_demand[1:simulation_length] #Hydrogen output
     end)
 
-    #Currently, it is really slow for hourly simulations, this is a temporary fix, where buying is excluded for hourly
-    if !(hourlymatching)
-
-            # Power bought from the DAM
-        @variable(
-            model,
-            0 <= p_DAM_buy[1:simulation_length]
-        )
-        
-            # Prevents buying and selling at the same time, speeding up model
+    if hourlymatching
         @constraint(
             model,
             [t in 1:simulation_length],
-            p_DAM_buy[t]*p_DAM_sell[t] == 0
+            p_DAM_buy[t] <= c_electrolyzer*electrolyzer.P_standby
         )
-    
-            # Upper bound power bought from the DAM, which should never exceed the max rated power of the electrolyzer
-        @constraint(
-            model, 
-            [t in 1:simulation_length], 
-            p_DAM_buy[t] <= c_electrolyzer
-        )
-
-            #Temporal correlation constraint
-        @constraint(
-            model, 
-            [k in (1:etc_length:simulation_length)], 
-            (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+etc_length-1))) <= 
-            0)
-        )
+    # else
+    #     @constraint(
+    #         model,
+    #         [t in 1:simulation_length],
+    #         p_DAM_buy[t] <= 3*maxcapgenerators
+    #     )
     end
 
+    # #Putting bounds on buying and selling
+    # @constraint(
+    #     model,
+    #     [t in 1:simulation_length],
+    #     p_DAM_sell[t] <= 3*maxcapgenerators
+    # )
+
+        #Temporal correlation constraint
+    @constraint(
+        model, 
+        [k in (1:etc_length:simulation_length)], 
+        (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+etc_length-1))) <= 
+        0)
+    )
+    
     # Defining the constraints
         # Number of upper bounds on variables that dramatically increase the model speed
             # Upper bound electrolyzer capacity, which should never exceed the max rated power of the RES
@@ -469,13 +526,6 @@ function solveoptimizationmodel(
         model, 
         (c_electrolyzer <= (c_wind_on+c_wind_off+c_solar))
     )
-    
-            # Upper bound power sold to the DAM, which could never exceed the max rated power of the RES
-    @constraint(
-        model, 
-        [t in 1:simulation_length],
-        p_DAM_sell[t] <= (c_wind_on+c_wind_off+c_solar)
-    ) 
 
             # Upper bound electrolyzer hydrogen storage input, which should never exceed the max rated power of the electrolyzer
     @constraint(
@@ -496,10 +546,10 @@ function solveoptimizationmodel(
         model, 
         [t in 1:simulation_length], 
         (p_electrolyzer[t] + p_DAM_sell[t] == 
-        getenergyin(model, timeseries, t, hourlymatching))
+        getenergyin(model, timeseries, t))
     )
 
-            # Upper bound electrolyzer power
+        #  Upper bound electrolyzer power
     @constraint(
         model, 
         [t in 1:simulation_length], 
@@ -507,7 +557,7 @@ function solveoptimizationmodel(
         upperbound_electrolyzer(model, electrolyzer, t))
     ) 
 
-            # Lower bound electrolyzer power
+        #  Lower bound electrolyzer power
     @constraint(
         model, 
         [t in 1:simulation_length], 
@@ -521,7 +571,7 @@ function solveoptimizationmodel(
         [t in 1:simulation_length],
         (h_electrolyzer[t] == getelectrolyzerproduction(model, electrolyzer, t))
     )
-        
+
         # Hydrogen storage capacity
     @constraint(
         model,
@@ -553,13 +603,15 @@ function solveoptimizationmodel(
         model,
         [t in 1:simulation_length],
         (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
-    )  
+    )
 
         # Hourly flexibility constraint
     @constraint(
         model,
         [t in 1:simulation_length],
-        (1-flexrange)*hourly_target <= h_demand[t] <= (1+flexrange)*hourly_target
+        (1-(flexrange/(2-flexrange)))*hourly_target <=
+        h_demand[t] <=
+        (1+(flexrange/(2-flexrange)))*hourly_target 
     )
 
         # Hydrogen temporal correlation constraint
@@ -575,7 +627,7 @@ function solveoptimizationmodel(
         model, 
         Min, 
         (getinvestmentcosts(model, parameters) +
-        sum(getmarketvalue(model, timeseries, t, hourlymatching) for t in 1:simulation_length))
+        sum(getmarketvalue(model, timeseries, lambda_TSO, t) for t in 1:simulation_length))
     )
 
     # Solving the model
@@ -607,9 +659,12 @@ function getresults(
     parameters::Parameter_Data,
     verbose::Bool
 )
+    if termination_status(model) != MOI.OPTIMAL
+        return NaN
+    end
+
     var_data = getresultsdict(model)
     # Defining the most commonly used parameternames for readability
-    simulation_length = parameters.scenario.simulation_length
 
     capacitycomponentpairs = zip(
         (var_data[:c_solar], var_data[:c_wind_on], var_data[:c_wind_off], var_data[:c_electrolyzer], var_data[:c_storage]),
@@ -621,11 +676,34 @@ function getresults(
     p_wind_on = parameters.timeseries.wind_on*var_data[:c_wind_on]
     p_wind_off = parameters.timeseries.wind_off*var_data[:c_wind_off]
     p_DAM = parameters.timeseries.price_DAM
-    p_DAM_buy = 0
     p_DAM_sell = var_data[:p_DAM_sell]
 
-    outcome_data = DataFrame(name = String[], capacity= Any[], cost = Any[])
+    # If the DAM price is not used, the DAM price is set to zero
+    if haskey(var_data, :p_DAM_buy)
+        p_DAM_buy = var_data[:p_DAM_buy]
+    else
+        p_DAM_buy = zeros(length(p_DAM))
+    end
 
+    power_data = DataFrame(
+        :p_solar => p_solar,
+        :p_wind_on => p_wind_on,
+        :p_wind_off => p_wind_off,
+        :p_electrolyzer => var_data[:p_electrolyzer],
+        :p_DAM_buy => p_DAM_buy,
+        :p_DAM_sell => p_DAM_sell
+    )
+
+    hydrogen_data = DataFrame(
+        :h_electrolyzer => var_data[:h_electrolyzer],
+        :h_storage_in => var_data[:h_storage_in],
+        :h_storage_out => var_data[:h_storage_out],
+        :h_demand => var_data[:h_demand],
+        :h_storage_soc => var_data[:h_storage_soc]
+    )
+
+    # Extracting outcomes
+    outcome_data = DataFrame(name = String[], capacity= Any[], cost = Any[])
     push!(outcome_data, ("Total costs", missing, objective_value(model)))
     push!(outcome_data, ("Average cost of Hydrogen", missing, objective_value(model)/parameters.scenario.production_target))
     push!(outcome_data, ("Electrolyzer capacity factor", mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), missing))
@@ -639,82 +717,273 @@ function getresults(
         println(outcome_data)
     end
 
-    #Decreasing font size to improve figure clarity
-    legendfontsize = 3
+    return Dict(
+        :power_data => power_data,
+        :hydrogen_data => hydrogen_data,
+        :outcome_data => outcome_data
+    )
+end
 
-    # Collecting all the plotted data
-    powerlabels = ["Solar", "Wind (onshore)", "Wind (offshore)", "Sell", "Electrolyzer"]
-    powerflow = [p_solar, p_wind_on, p_wind_off, var_data[:p_DAM_sell], var_data[:p_electrolyzer]]
-    hydrogenflow = [var_data[:h_electrolyzer], var_data[:h_storage_in], var_data[:h_storage_out], var_data[:h_demand]]
+function savedata(
+    data::Dict{Any,Any},
+    parameters::Parameter_Data
+)
+    filename = "results_$(parameters.scenario.etc_length)_$(Parameters.scenario.htc_length)_$(parameters.scenario.flexrange).csv"
+    # Saving the results to a csv file
+    combined_data = hcat(data[:power_data], data[:hydrogen_data])
+    CSV.write(filename, combined_data)
+end
 
-    # Checks if the current model is not hourly, which means it has buying data for the DAM. Then adds the data and label for plotting.
-    if haskey(var_data, :p_DAM_buy)
-        println("Including buy from DAM market")
-        p_DAM_buy = var_data[:p_DAM_buy]
-        insert!(powerlabels, 4, "Buy")
-        insert!(powerflow, 4, p_DAM_buy)
+function addLCOH(
+    results::DataFrame
+)
+    LCOH = []
+    for (i, result) in enumerate(results[:, "Results"])
+        if isa(result, Dict)
+            append!(LCOH, result[:outcome_data][2, :cost]) 
+        elseif isnan(result)
+            append!(LCOH, NaN)
+        end 
+    end
+    results[:, "LCOH"] = LCOH
+    return results
+end
+
+function makeplot(
+    flows::Array{Array{Float64,1},1},
+    labels::Array{String,1};
+    twindata::Union{Array{Float64,1}, Bool}=false,
+    twinlabel::Union{String, Bool}=false,
+    subsetsize::Union{Int64, Bool}=false
+)
+    # Removing the flows and labels that are all zeros
+    zeros = findall(x->iszero(x), flows)
+    deleteat!(flows, zeros)
+    deleteat!(labels, zeros)
+
+    # Taking flow subsets 
+    if subsetsize != false
+        println("Taking a subset of the flows")
+        flows = map(x->x[1:subsetsize], flows)
+        if isa(twindata, Array)
+            twindata = twindata[1:subsetsize]
+        end
     end
 
-    #transforms labels back into matrix, which is needed for plotting
-    powerlabels = permutedims(powerlabels)
+    fig = Figure()
+
+    ax1 = Axis(fig[1,1])
+    series!(ax1, flows, labels=labels)
+
+    # Adding legend
+    axislegend(ax1; position=:lt)
+
+    # Adding a twin axis if needed
+    if isa(twindata, Array)
+        ax2 = Axis(fig[1,1], yaxisposition=:right)
+        hidespines!(ax2)
+        hidexdecorations!(ax2)
+        series!(ax2, [twindata], labels=[twinlabel], solid_color=:black, linestyle=:dash)
+        axislegend(ax2; position=:rt)
+    end
+
+
+    return fig, ax1
+end
+
+function powerfig(
+    powerflow::Array{Array{Float64,1},1},
+    powerlabels::Array{String,1};
+    twindata::Union{Array{Float64,1}, Bool}=false,
+    subsetsize::Union{Int64, Bool}=false
+)
+    fig, ax1 = makeplot(powerflow, powerlabels; twindata=twindata, subsetsize=subsetsize)
+    ax1.title = "Power flows"
+    ax1.ylabel ="Power [MW]"
+    ax1.xlabel = "Time [h]"
+    #ax2[:set_ylabel]("DAM price [€/MWh]")
+    return fig
+end
+
+function hydrogenfig(
+    hydrogenflow::Array{Array{Float64,1},1},
+    hydrogenlabels::Array{String,1};
+    twindata::Union{Array{Float64,1}, Bool}=false,
+    subsetsize::Union{Int64, Bool}=false
+)
+    fig, ax1 = makeplot(hydrogenflow, hydrogenlabels; twindata=twindata, twinlabel="SOC", subsetsize=subsetsize)
+    ax1.title = "hydrogen flows"
+    ax1.ylabel ="hydrogen [kg]"
+    ax1.xlabel = "Time [h]"
+    #ax2[:set_ylabel]("DAM price [€/MWh]")
+    return fig
+end
+
+function plotdata(
+    data::Dict{Symbol,DataFrame}
+)
+    # set_theme!(;
+    #     resolution=(800, 600),
+    #     background_color="white",
+    #     fontsize=8,
+    #     Axis(;
+    #         xgridstyle=:dash,
+    #         ygridstyle=:dash,
+    #         ),
+    # )
+    powerdata = data[:power_data]
+    hydrogendata = data[:hydrogen_data]
+
+    # Collecting all the power data
+    powerlabels = ["Solar", "Wind (onshore)", "Wind (offshore)", "Buy", "Sell", "Electrolyzer"]
+    powerflow = [powerdata[:, datapoint] for datapoint in [:p_solar, :p_wind_on, :p_wind_off, :p_DAM_buy, :p_DAM_sell, :p_electrolyzer]]
+
+    # Collecting all the power data
+    hydrogenlabels = ["Electrolyzer", "Storage in", "Storage out", "Demand"]
+    hydrogenflow = [hydrogendata[:, datapoint] for datapoint in [:h_electrolyzer, :h_storage_in, :h_storage_out, :h_demand]]
+    hsoc = hydrogendata[:, :h_storage_soc]
 
     # Plotting the power flows over the entire period
-    powerplot = plot(
-        range(1,simulation_length), powerflow, 
-        label=powerlabels, 
-        xlabel="Time", ylabel="Power (MW)", title="Power flow", 
-        legend=:topleft, legend_font_pointsize=legendfontsize)
-    # Plots the price of the DAM market on a second y-axis
-    powerplot = plot!(
-        twinx(), p_DAM, color=:black, linestyle=:dash, 
-        label="Price", ylabel="Price (€/MWh)", legend=:topright, 
-        legend_font_pointsize=legendfontsize)
+    println("Working on full plot")
+    pfig = powerfig(powerflow, powerlabels)
+    println("Working on subset plot")
+    sub_pfig= powerfig(powerflow, powerlabels; subsetsize=(24*14))
+    println("Working on hydrogen plot")
+    hplot = hydrogenfig(hydrogenflow, hydrogenlabels)
+    println("Working on hydrogen subplot")
+    hsubplot = hydrogenfig(hydrogenflow, hydrogenlabels; twindata=hsoc, subsetsize=(24*14))
     
-    # Plotting the hydrogen flows over the entire period
-    hydrogenplot = plot(
-        range(1, simulation_length), hydrogenflow, 
-        label=["Electrolyzer" "Storage in" "Storage out" "Demand"], 
-        xlabel="Time", ylabel="Hydrogen (kg)", title="Hydrogen flow", legend=:topleft, 
-        legend_font_pointsize=legendfontsize)
-    # Plots the storage SOC on a second y-axis
-    hydrogenplot = plot!(
-        twinx(), var_data[:h_storage_soc]./var_data[:c_storage], color=:black, linestyle=:dash, 
-        label="Storage SOC", ylabel="Storage SOC (%)", legend=:topright, 
-        legend_font_pointsize=legendfontsize)
-    plots = Dict("powerflow" => powerplot, "hydrogenflow" => hydrogenplot)
+    return pfig, sub_pfig, hplot, hsubplot
+end
 
-    #Plot subsets if simulation is long, identical to plots above, but over shorter period
-    if simulation_length >= 24*14
-        subsetsize = 24*7
-        subsetpowerflow = map(x->x[1:subsetsize], powerflow)
-        subsethydrogenflow = map(x->x[1:subsetsize], hydrogenflow)
+function make3dplot(
+    results::DataFrame
+)
+    X = convert(Array{Float32,1}, results[:, :etc_length])
+    Y = convert(Array{Float32,1}, 100*results[:, :flexrange])
+    Z = convert(Array{Float32,1}, results[:, :htc_length])
 
-        sub_powerplot = plot(
-            range(1, subsetsize), subsetpowerflow, 
-            label=powerlabels, 
-            xlabel="Time", ylabel="Power (MW)", title="Power flow", 
-            legend=:topleft, legend_font_pointsize=legendfontsize)
-        sub_powerplot = plot!(
-            twinx(), p_DAM[1:subsetsize], color=:black, 
-            linestyle=:dash, label="Price", ylabel="Price (€/MWh)", 
-            legend=:topright, legend_font_pointsize=legendfontsize)
+    C = [convert(Float32, x) for x in (results[:, :LCOH])]
 
-        sub_hydrogenplot = plot(
-            range(1, subsetsize), subsethydrogenflow, 
-            label=["Electrolyzer" "Storage in" "Storage out" "Demand"], 
-            xlabel="Time", ylabel="Hydrogen (kg)", 
-            title="Hydrogen flow", legend=:topleft, 
-            legend_font_pointsize=legendfontsize)
-        sub_hydrogenplot = plot!(
-            twinx(), var_data[:h_storage_soc][1:subsetsize]./var_data[:c_storage], 
-            color=:black, linestyle=:dash, label="Storage SOC", 
-            ylabel="Storage SOC (%)", legend=:topright, 
-            legend_font_pointsize=legendfontsize)
-        subplots = Dict("powerflow(subplot)" => sub_powerplot, "hydrogenflow(subplot)" => sub_hydrogenplot)
-        plots = merge(plots, subplots)
+    fig = Figure()
+    ax1=Axis3(fig[1, 1], aspect=(1,1,1), azimuth = pi/4.8,elevation=pi/6)
+
+    plt1 = scatter!(X, Y, Z, markersize=20, label="Scenario", color=C)
+    #Legend(fig[1,2], ax1, valign=:top)
+    Colorbar(fig[1,2], plt1, label="LCOH [€/kg]")
+    
+    ax1.xlabel="ETC length (h)"
+    ax1.ylabel="Flexibility range (%)"
+    ax1.zlabel="HTC length (h)"
+    ax1.title="LCOH"
+    fig
+end
+
+function makeheatmap(
+    results::DataFrame;
+    normalized::Bool=true
+)
+    X=:etc_length
+    Y2=:flexrange
+    Y1=:htc_length
+
+    # Sorting results
+    sort!(results, [X, Y1, Y2])
+
+    timedict = Dict(
+        1 => "Hourly",
+        24 => "Daily",
+        168 => "Weekly",
+        336 => "Biweekly",
+        672 => "Monthly",
+        2016 => "Quarterly",
+        4032 => "Half-yearly",
+        8064 => "Yearly"
+    )
+
+    Xlabels = [timedict[label] for label in unique(results[:, X])]
+    Y2labels = ["$(100*label)%" for label in unique(results[:, Y2])]
+    Y1labels = [timedict[label] for label in unique(results[:, Y1])]
+    Xscenarios = length(Xlabels)
+    Yscenarios = length(Y1labels)*length(Y2labels)
+
+    Xvals = repeat(range(1, Xscenarios), inner=convert(Int64,Yscenarios))
+    Yvals = repeat(range(1, Yscenarios), convert(Int64,Xscenarios))
+
+    Cvals = [convert(Float32, x) for x in (results[:, :LCOH])]
+    if normalized
+        Cvals = Cvals./mean(filter(!isnan, Cvals))
     end
 
-    return Dict("data" => outcome_data, "figures" => plots)
+    fig = Figure()
+    ax1=Axis(
+        fig[1, 1], 
+        xlabel="ETC length", 
+        ylabel="HTC length", 
+        title="Average cost of hydrogen production for various scenarios without optimization [€/kg]",
+        xticks=(range(1, Xscenarios),Xlabels),
+        yticks=(
+            range(
+                start=length(Y2labels)/2+0.5, 
+                stop=Yscenarios-length(Y2labels)/2+0.5, 
+                length=length(Y1labels)
+            ), 
+            Y1labels
+        ),
+        xminorticks=range(start=0.5, stop=Xscenarios+0.5, length=Xscenarios+1),
+        yminorticks=range(start=0.5, stop=Yscenarios+0.5, length=length(Y1labels)+1),
+        xminorticksvisible = true,
+        yminorticksvisible = true,
+        xminortickalign=0.75,
+        yminortickalign=0.75,
+        xminorticksize=60,
+        yminorticksize=40,
+        xticksize=0,
+        yticksize=0
+    )
+
+    # Calculate colorbar range
+    # Find maximum deviation from mean and round to nearest 0.1
+    maxdeviation = ceil(maximum(abs.(Cvals.-1).*100))
+    colorbarrange = (100-maxdeviation, 100+maxdeviation)./100
+    colorbarticks = (100-maxdeviation:10:100+maxdeviation)./100
+    colorbarticklabels = ["$(convert(Int64, round(100*tick)))%" for tick in colorbarticks]
+
+    println(maxdeviation)
+    println(colorbarrange)
+    println([x for x in colorbarticks])
+    println(colorbarticklabels)
+
+    hm = heatmap!(Xvals, Yvals, Cvals, colormap=cgrad(:RdYlGn_8, rev=true), colorrange=colorbarrange, nan_color = :snow2)
+
+    ax2=Axis(
+        fig[1, 1],
+        yaxisposition=:right,
+        ylabel="Flexibility range (%)",
+        yticks=(
+            range(
+                start=1/4,
+                stop=10-1/4,
+                length=Yscenarios
+            ),
+            repeat(Y2labels, length(Y1labels))
+        ),
+        ylabelsize=16,
+        yticklabelsize=10,
+        yminorticksvisible = true,
+        yminortickalign=1,
+        yminorticksize=5,
+        yticksize=0,
+        yticksmirrored=true,
+        yminorgridvisible=true,
+        yminorgridcolor=:black,
+        yminorgridwidth=2,
+    )
+    hidespines!(ax2)
+    hidexdecorations!(ax2)
+    
+    Colorbar(fig[:,2], hm, label="Deviations from mean [%]", ticks=(colorbarticks, colorbarticklabels))
+fig
 end
 
 function saveresults(
@@ -735,38 +1004,95 @@ function saveresults(
 end
 
 """
-    main(parameterfilename::String)
+    optimizeptx(
+        parameters::Parameter_Data, 
+        verbose::Bool=true, 
+        savepath::String="$(home_dir)/Results", 
+        savefigs::Bool=true, 
+        savecsv::Bool=true
 
-This function is the main function of the optimization model. 
+This function caries out the optimization. This method works on the Parameter_Data struct.
     It takes a parameterfilename and solves the optimization model with the given parameters.
 
 # Arguments
 
-- `parameterfilename::String`: Name of the parameterfile, which should be a .json file
+- `parameters::Parameter_Data`: Parameter data for the optimization model
+- `verbose::Bool=true`: If true, prints the parameters to the console
+- `savepath::String="$(home_dir)/Results"`: Path to save the results
+- `savefigs::Bool=true`: If true, saves the figures to the savepath
+- `savecsv::Bool=true`: If true, saves the csv files to the savepath
 
 # Returns
 
 - `results::Dict{String, Any}`: Dictionary containing the results of the optimization model
 
 """
-function main(
-    parameterfilename::String, 
+function optimizeptx(
+    parameters::Parameter_Data, 
     verbose::Bool=true,
     savepath::String="$(home_dir)/Results",
-    savefigs::Bool=true,
     savecsv::Bool=true
 )
-    parameters = fetchparameterdata(parameterfilename)
     if verbose
         println("Parameters: ", parameters)
     end
-    model = solveoptimizationmodel(parameters, 240, 0.05)
-    if termination_status(model) == MOI.OPTIMAL
+    solvedmodel = solveoptimizationmodel(parameters, 120, 0.05)
+    if termination_status(solvedmodel) == MOI.OPTIMAL
         println("Optimal solution found.")
-        results = getresults(model, parameters, verbose)
-        saveresults(results, parameters, savepath, savefigs, savecsv)
+        results = getresults(solvedmodel, parameters, verbose)
     else
         throw(ErrorException("Optimal solution not found."))
     end
     return results
 end
+
+"""
+    optimizeptx(
+        parameters::DataFrame, 
+        verbose::Bool=true, 
+        savepath::String="$(home_dir)/Results", 
+        savefigs::Bool=true, 
+        savecsv::Bool=true
+    )
+
+    Same as optimizeptx, but then the method for DataFrame as input. 
+"""
+
+function optimizeptx(
+    parameterdf::DataFrame, 
+    verbose::Bool=true,
+    savepath::String="$(home_dir)/Results",
+    savecsv::Bool=true
+)
+    if verbose
+        println("Parameters: ", parameterdf)
+    end
+    solutiondataframe = select(parameterdf, Not("Parameters"))
+    solutiondataframe[:, "Results"] = [
+        getresults(
+            solveoptimizationmodel(
+                parameters, 
+                120, 
+                0.05
+            ), 
+            parameters, 
+            verbose
+        ) for parameters in parameterdf[:, "Parameters"]
+    ]
+    return addLCOH(solutiondataframe)
+end
+
+
+function mainscript(
+    parameterfilename::String,
+    verbose::Bool=true,
+    savepath::String="$(home_dir)/Results",
+    savecsv::Bool=true
+)   
+    parameters = fetchparameterdata(parameterfilename)
+
+    results = optimizeptx(parameters, verbose, savepath)
+    #plotdf(results)
+    return results
+end
+

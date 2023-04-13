@@ -1,23 +1,24 @@
 {
     "scenarios": {
-        "name": "Example_2021",
-        "simulation_days": 168,
+        "name": "Example_ESP",
+        "simulation_days": 84,
         "hourly_target": 100,
-        "etc_length": 168,
-        "htc_length": 168,
-        "flexrange": 0.5,
-        "discount_rate": 0.05
+        "etc_length": [672, 336, 168, 24, 1],
+        "htc_length": [672, 336, 168, 24, 1],
+        "flexrange": [0, 0.25, 0.5, 0.75, 1],
+        "discount_rate": 0.05,
+        "lambda_TSO": 10
     },
     "components": {
         "solar": {
             "systemprice": 628000,
-            "fixopex": 0.02,
+            "fixopex": 0.013,
             "lifetime": 30,
             "maxcapacity": 0.5
         },
         "wind_on": {
             "systemprice": 1325000,
-            "fixopex": 0.02,
+            "fixopex": 0.011,
             "lifetime": 20
         },
         "wind_off": {
@@ -26,19 +27,19 @@
             "lifetime": 20
         },
         "electrolyzer": {
-            "systemprice": 1000000,
+            "systemprice": 1400000,
             "fixopex": 0.02,
             "lifetime": 15,
-            "efficiency": 18.5,
-            "P_min": 0.1,
+            "efficiency": 18.8,
+            "P_min": 0.15,
             "P_standby": 0.01},
         "storage": {
-            "systemprice": 190,
-            "fixopex": 0.07,
+            "systemprice": 378,
+            "fixopex": 0.02,
             "lifetime": 30,
             "efficiency": 0.78,
             "soc_init": 0.5
         }
     },
-    "timeseriesfile": "ES_Timeseriesdata2021.csv"
+    "timeseriesfile": "ES_Timeseriesdata2020.csv"
 }

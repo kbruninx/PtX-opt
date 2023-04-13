@@ -23,15 +23,36 @@ function dataframefromcsv(
     csvfilename::String
 )
     df = CSV.read(csvfilename, DataFrame, types = Float64)
+    describe(df)
     return df
 end
 
-function normalizecolumns(
+function findrowsofmissingvalues(
     df::DataFrame
-)   
+)
     for columnname in names(df)
+        println("Finding missing values in column $(columnname)")
+        for i in 1:length(df[:, columnname])
+            if ismissing(df[i, columnname])
+                println("Missing value at row $(i)")
+            elseif isnan(df[i, columnname])
+                println("NaN value at row $(i)")
+            end
+        end
+    end
+end
+
+function normalizecolumns(
+    df::DataFrame,
+    except::Union{Array{String, 1},Array{Symbol, 1}} = []
+)   
+    for columnname in names(select(df, Not(except)))
+        println("Normalizing column $(columnname), with mean value: $(mean(df[:, columnname]))")
         maxval = maximum(df[:, columnname])
-        df[:, columnname] = df[:, columnname] ./ maxval
+        println("Max value: $(maxval)")
+        if maxval != 0
+            df[:, columnname] = df[:, columnname] ./ maxval
+        end
     end
     return df
 end
