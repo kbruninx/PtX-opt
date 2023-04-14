@@ -1,8 +1,10 @@
 {
     "scenarios": {
         "name": "Example_2021",
-        "simulation_days": 168,
-        "hourly_target": 100,
+        "simulation_days": 84,
+        "generation_capacity": 1,
+        "hydrogen_price": 6.5,
+        "TSO_tariff": 10,
         "etc_length": 168,
         "htc_length": 168,
         "flexrange": 0.5,

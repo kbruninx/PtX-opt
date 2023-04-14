@@ -34,11 +34,10 @@ struct Scenario_Data
     simulation_length::Int64 # length in hourly timesteps
     # Financial parameters
     discount_rate::Float64
-    lambda_TSO::Float64 # TSO penalty factor
+    hydrogen_price::Float64 # €/kg
+    TSO_tariff::Float64 # TSO penalty factor
     timefactor::Float64 # Annual to simulation length conversion factor
     # Hydrogen target
-    hourly_target::Float64 # kg/h of hydrogen production
-    production_target::Float64 # kg of hydrogen production
     etc_length::Int64 #number of hours per electricity temporal correlation period
     htc_length::Int64 #number of hours per hyrdogen temporal correlation period
     flexrange::Float64 #flexibility range in % of the hourly target
@@ -101,10 +100,9 @@ Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Simulation days = $(s.simulation_days),
     Simulation length = $(s.simulation_length),
     Discount rate = $(s.discount_rate),
-    TSO tariff = $(s.lambda_TSO),
+    Hydrogen price = $(s.hydrogen_price),
+    TSO tariff = $(s.TSO_tariff),
     Timefactor = $(s.timefactor),
-    Hourly production target = $(s.hourly_target),
-    Total production target = $(s.production_target),
     Electrical Temporal Correlation length = $(s.etc_length),
     Hydrogen Temporal Correlation length = $(s.htc_length),
     Flexibility range = $(s.flexrange)"
@@ -218,10 +216,9 @@ function scenariofromdict(dict)
         dict["simulation_days"],
         dict["simulation_days"]*24,
         dict["discount_rate"],
-        dict["lambda_TSO"],
+        dict["hydrogen_price"],
+        dict["TSO_tariff"],
         dict["simulation_days"]*24/(365*24),
-        dict["hourly_target"],
-        dict["hourly_target"]*dict["simulation_days"]*24,
         dict["etc_length"],
         dict["htc_length"],
         dict["flexrange"]
@@ -319,7 +316,7 @@ function maxcapelectrolyzer(
 )
     min_capacityfactor = 0.05 #REVIEW this value
     return(
-        parameters.scenario.hourly_target/parameters.components["electrolyzer"].efficiency/min_capacityfactor
+        parameters.scenario.generation_capacity/parameters.components["electrolyzer"].efficiency/min_capacityfactor
     )
 end
 
@@ -328,7 +325,7 @@ function maxcapstorage(
 )
     max_storageoftotal = 0.5 #REVIEW this value
     return(
-        max_storageoftotal*parameters.scenario.production_target
+        max_storageoftotal*parameters.scenario.generation_capacity
     )
 end
 
@@ -396,10 +393,10 @@ end
 function getmarketvalue(
     model::JuMP.Model,
     timeseries::Timeseries_Data,
-    lambda_TSO::Float64,
+    TSO_tariff::Float64,
     t::Int64
 )
-    return model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) - model[:p_DAM_sell][t] * timeseries.price_DAM[t]
+    return model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + TSO_tariff) - model[:p_DAM_sell][t] * timeseries.price_DAM[t]
 end
 
 """
@@ -445,27 +442,31 @@ function solveoptimizationmodel(
 
     # Defining the most commonly used parameternames for readability
     simulation_length = parameters.scenario.simulation_length
-    hourly_target = parameters.scenario.hourly_target
     etc_length = parameters.scenario.etc_length
     htc_length = parameters.scenario.htc_length
     flexrange = parameters.scenario.flexrange
     timeseries = parameters.timeseries
-    lambda_TSO = parameters.scenario.lambda_TSO
+    TSO_tariff = parameters.scenario.TSO_tariff
     electrolyzer = parameters.components["electrolyzer"]
     storage = parameters.components["storage"]
     
     hourlymatching = (etc_length==1)
     println("Hourly matching: ", hourlymatching)
-    maxcapgenerators = 100
+
+    #Assumptions
+    totalcapgenerator = 1
+    hydrogenprice = parameters.scenario.hydrogen_price
+    hourlytargetcap = electrolyzer.efficiency*totalcapgenerator
 
     # Defining the variables
         # Design (these caps are currently arbitrary, should be added to json file)
     @variables(model, begin
-        0 <= c_solar <= maxcapgenerators #Solar capacity
-        0 <= c_wind_on <= maxcapgenerators #Onshore capacity
-        0 <= c_wind_off <= maxcapgenerators #Offshore capacity
-        0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
-        0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
+        0 <= c_solar <= totalcapgenerator #Solar capacity as fraction of total capacity
+        0 <= c_wind_on <= totalcapgenerator #Onshore capacity as fraction of total capacity
+        0 <= c_wind_off <= totalcapgenerator #Offshore capacity as fraction of total capacity
+        0 <= c_electrolyzer <= totalcapgenerator #Electrolyzer capacity
+        0 <= c_storage <= hourlytargetcap*simulation_length #Storage capacity
+        0 <= hourly_target <= hourlytargetcap #Hourly target
     end)
 
     # Optional constraints for fixed capacities
@@ -496,20 +497,13 @@ function solveoptimizationmodel(
             [t in 1:simulation_length],
             p_DAM_buy[t] <= c_electrolyzer*electrolyzer.P_standby
         )
-    # else
-    #     @constraint(
-    #         model,
-    #         [t in 1:simulation_length],
-    #         p_DAM_buy[t] <= 3*maxcapgenerators
-    #     )
     end
 
-    # #Putting bounds on buying and selling
-    # @constraint(
-    #     model,
-    #     [t in 1:simulation_length],
-    #     p_DAM_sell[t] <= 3*maxcapgenerators
-    # )
+    # Fixing total capacity of generators
+    @constraint(
+        model,
+        c_solar+c_wind_on+c_wind_off == totalcapgenerator
+    )
 
         #Temporal correlation constraint
     @constraint(
@@ -605,13 +599,20 @@ function solveoptimizationmodel(
         (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
     )
 
-        # Hourly flexibility constraint
+        # Hourly flexibility lowerbound
     @constraint(
         model,
         [t in 1:simulation_length],
         (1-(flexrange/(2-flexrange)))*hourly_target <=
+        h_demand[t]
+    )
+
+        # Hourly flexibility upperbound
+    @constraint(
+        model,
+        [t in 1:simulation_length],
         h_demand[t] <=
-        (1+(flexrange/(2-flexrange)))*hourly_target 
+        (1+(flexrange/(2-flexrange)))*hourly_target
     )
 
         # Hydrogen temporal correlation constraint
@@ -625,9 +626,10 @@ function solveoptimizationmodel(
     # Defining the objective function
     @objective(
         model, 
-        Min, 
-        (getinvestmentcosts(model, parameters) +
-        sum(getmarketvalue(model, timeseries, lambda_TSO, t) for t in 1:simulation_length))
+        Max, 
+        hydrogenprice*hourly_target*simulation_length - 
+        getinvestmentcosts(model, parameters) -
+        sum(getmarketvalue(model, timeseries, TSO_tariff, t) for t in 1:simulation_length)
     )
 
     # Solving the model
@@ -702,15 +704,20 @@ function getresults(
         :h_storage_soc => var_data[:h_storage_soc]
     )
 
+    profitpower = sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))
+    profithydrogen = (var_data[:hourly_target]*parameters.scenario.simulation_length*parameters.scenario.hydrogen_price)
+    profithydrogenshare = profithydrogen/(profithydrogen+profitpower)
+    electrolyzercapacityfactor = mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer])
+
     # Extracting outcomes
     outcome_data = DataFrame(name = String[], capacity= Any[], cost = Any[])
-    push!(outcome_data, ("Total costs", missing, objective_value(model)))
-    push!(outcome_data, ("Average cost of Hydrogen", missing, objective_value(model)/parameters.scenario.production_target))
-    push!(outcome_data, ("Electrolyzer capacity factor", mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), missing))
+    push!(outcome_data, ("Total profit", missing, objective_value(model)))
+    push!(outcome_data, ("Hydrogen profit", missing, "$(round(profithydrogenshare*100))%"))
+    push!(outcome_data, ("Electrolyzer capacity factor", "$(round(electrolyzercapacityfactor*100))%", missing))
     for (capacity, component) in capacitycomponentpairs
         push!(outcome_data, (name(component), capacity, getcomponentcosts(capacity, parameters.scenario, component)))
     end
-    push!(outcome_data, ("Total profit power market", missing, sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))))
+    push!(outcome_data, ("Total profit power market", missing, profitpower))
 
     # Printing the results if verbose
     if verbose
