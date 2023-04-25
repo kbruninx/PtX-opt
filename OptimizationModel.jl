@@ -26,6 +26,7 @@ CairoMakie.activate!(type = "svg")
 # Directory
 const home_dir = @__DIR__
 
+
 # Useful structures
 struct Scenario_Data
     name::String
@@ -42,13 +43,16 @@ struct Scenario_Data
     etc_length::Int64 #number of hours per electricity temporal correlation period
     htc_length::Int64 #number of hours per hyrdogen temporal correlation period
     flexrange::Float64 #flexibility range in % of the hourly target
+    # Cap on combined generation capacity
+    maxcapgeneration::Number
 end
 
 struct Component_Data
-    name:: String
-    systemprice::Float64    # €/unit
-    fixopex::Float64        # fixed operating expenses as a fraction of the system price
+    name::String
+    systemprice::Number    # €/unit
+    fixopex::Number        # fixed operating expenses as a fraction of the system price
     lifetime::Int64         # lifetime in years
+    maxcapacity::Number          # maximum capacity in MW
 end
 
 # Getters
@@ -75,6 +79,16 @@ struct Storage_Data
     # Additional storage parameters
     efficiency::Float64     # kgout/kgin
     soc_init::Float64       # %
+end
+
+#Forwards function calls to the component_data field for the Storage_Data structure
+@forward((Storage_Data, :component_data), Component_Data)
+
+struct Compressor_Data
+    # Storage data structure, containing additional storage data needed for the optimization model
+    component_data::Component_Data
+    # Additional storage parameters
+    constant::Float64     # K constant for the compressor
 end
 
 #Forwards function calls to the component_data field for the Storage_Data structure
@@ -107,14 +121,16 @@ Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Total production target = $(s.production_target),
     Electrical Temporal Correlation length = $(s.etc_length),
     Hydrogen Temporal Correlation length = $(s.htc_length),
-    Flexibility range = $(s.flexrange)"
+    Flexibility range = $(s.flexrange),
+    Max combined generation capacity = $(s.maxcapgeneration)"
 )
 
 Base.show(io::IO, c::Component_Data) = print(io, "Component Data:
     Name = $(c.name),
     System price = $(c.systemprice),
     Fixed OPEX = $(c.fixopex),
-    Lifetime = $(c.lifetime)"
+    Lifetime = $(c.lifetime),
+    Max capacity = $(c.maxcapacity)"
 )
 
 Base.show(io::IO, e::Electrolyzer_Data) = print(io, "Electrolyzer Data:
@@ -128,6 +144,11 @@ Base.show(io::IO, s::Storage_Data) = print(io, "Storage Data:
     $(s.component_data),
     Efficiency = $(s.efficiency),
     Initial State of Charge = $(s.soc_init)"
+)
+
+Base.show(io::IO, s::Compressor_Data) = print(io, "Compressor Data:
+    $(s.component_data),
+    Constant = $(s.constant)"
 )
 
 Base.show(io::IO, t::Timeseries_Data) = print(io, "Timeseries Data:
@@ -145,21 +166,23 @@ Base.show(io::IO, p::Parameter_Data) = print(io, "Parameter Data:
 
 # Auxiliary functions
     #Fetching data
-function fetchparameterdata(parameterfile)
+function fetchparameterdata(
+    parameterfile
+    )
     d = JSON.parsefile(parameterfile)
     scenarios = combinescenarios(d["scenarios"])
-    components = componentsfromdict(d["components"])
+    components = combinecomponents(d["sensitivity_analysis"], d["components"])
     timeseries = timeseriesfromdict(d["timeseriesfile"], d["scenarios"])
 
-    # If there is only one scenario, return a Parameter_Data
-    if scenarios isa Scenario_Data
+    # If it is only a case study, return a Parameter_Data struct
+    if scenarios isa Scenario_Data && components isa Dict
         return Parameter_Data(
                 scenarios,
                 components,
                 timeseries
         )
-    # If there are multiple scenarios, return a DataFrame with a column of Parameter_Data
-    elseif scenarios isa DataFrame
+    # If there are multiple scenarios, and no sensitivity analysis, return a DataFrame with the Parameter_Data structs
+    elseif scenarios isa DataFrame && components isa Dict
         parameterdata = select(scenarios, Not("Scenario"))
         parameterdata[:, "Parameters"] = [Parameter_Data(
             scenario,
@@ -167,40 +190,92 @@ function fetchparameterdata(parameterfile)
             timeseries
             ) for scenario in scenarios[:, "Scenario"]]
         return parameterdata
+    # If there is a sensetivity analysis, and only one scenario, return a DataFrame with the Parameter_Data structs
+    elseif scenarios isa Scenario_Data && components isa DataFrame
+        parameterdata = select(components, Not("ComponentData"))
+        parameterdata[:, "Parameters"] = [Parameter_Data(
+            scenarios,
+            case,
+            timeseries
+            ) for case in components[:, "ComponentData"]]
+        return parameterdata
     else
-        error("Scenario data is neither a Scenario_Data nor a DataFrame")
+        error("This type of data entry is currently not supported")
     end
 end
 
-function permutatedict(
+function combinecomponents(
+    sensitivity::Dict,
+    components::Dict
+)
+    componentscenarios = DataFrame(
+        "Component"=> String[], 
+        "Variable" => String[], 
+        "Adjustment" => Float64[],
+        "ComponentData" => Dict{String, Any}[]
+    )
+    if sensitivity["variables"] isa Bool
+        if sensitivity["variables"] == false
+            return componentsfromdict(components)
+        end
+    end
+    if sensitivity["variables"] isa Array
+        for component in keys(components)
+            for variable in sensitivity["variables"]
+                for adjustment in sensitivity["adjustments"]
+                    newcomponents = deepcopy(components)
+                    newcomponents[component][variable] *= adjustment
+                    push!(
+                        componentscenarios,
+                        (component, 
+                            variable, 
+                            adjustment, 
+                            componentsfromdict(newcomponents)
+                        ), 
+                    )
+                end
+            end
+        end
+        return componentscenarios
+    end
+end
+
+function permutate(
+    dict::Dict{String, Any}
+)
+    return [Dict{String,Any}(zip(keys(dict), p)) for p in Iterators.product(values(dict)...)]
+end
+
+function permutatescenarios(
     dict::Dict{String, Any}
 )
     #Checking for variables of interest (arrays)
     varsofinterest = [key for (key, value) in dict if value isa Array]
-    #If there are none, return the scenario
+    #If there are none, return the scenario as a dict
     if varsofinterest == []
-        return scenariofromdict(dict), varsofinterest
+        return dict, varsofinterest
     end
     #Take out the name of scenario and permutate the rest
     name = pop!(dict, "name")
-    permutations = [Dict{String,Any}(zip(keys(dict), p)) for p in Iterators.product(values(dict)...)]
+    permutations = permutate(dict)
     #Put the name back in
     for p in permutations
         p["name"] = name
     end
-
     return permutations, varsofinterest
 end
+
+
 
 function combinescenarios(
     scenariodict::Dict{String, Any}
     )
     #Get the scenarios and the variables of interest
-    scenarios, varsofinterest = permutatedict(scenariodict)
+    scenarios, varsofinterest = permutatescenarios(scenariodict)
 
     #If there are no variables of interest, return a Scenario_Data
     if varsofinterest == []
-        return scenarios
+        return scenariofromdict(scenarios)
     end
 
     #Initialize the DataFrame
@@ -224,7 +299,8 @@ function scenariofromdict(dict)
         dict["hourly_target"]*dict["simulation_days"]*24,
         dict["etc_length"],
         dict["htc_length"],
-        dict["flexrange"]
+        dict["flexrange"],
+        dict["maxcapgeneration"]
     )
 end
 
@@ -235,7 +311,8 @@ function componentsfromdict(dict)
             k,
             v["systemprice"],
             v["fixopex"],
-            v["lifetime"]
+            v["lifetime"],
+            v["maxcapacity"]
         )
     end
     out["electrolyzer"] = Electrolyzer_Data(
@@ -248,6 +325,10 @@ function componentsfromdict(dict)
         out["storage"],
         dict["storage"]["efficiency"],
         dict["storage"]["soc_init"]
+    )
+    out["compressor"] = Compressor_Data(
+        out["compressor"],
+        compressorconstant(dict["compressor"])
     )
     return out
 end
@@ -287,11 +368,11 @@ end
 
 function getinvestmentcosts(
     model::JuMP.Model,
-    parameters::Parameter_Data,
+    parameters::Parameter_Data
 )
     sum = 0
     capacitycomponentpairs = zip(
-        (model[:c_solar], model[:c_wind_on], model[:c_wind_off], model[:c_electrolyzer], model[:c_storage]),
+        (model[char] for char in [:c_solar, :c_wind_on, :c_wind_off, :c_electrolyzer, :c_storage]),
         (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
     )
     for (capacity, component) in capacitycomponentpairs
@@ -345,16 +426,18 @@ function getelectrolyzerproduction(
     )
 end
 
+#The net power consumption from the grid, which excludes standby and compressor consumption
 function getnetpower(
     model::JuMP.Model,
     electrolyzer::Electrolyzer_Data,
     t::Int64
 )
     return (
-        model[:p_DAM_buy][t] .-
-        (model[:p_DAM_sell][t] .+
-        ((1 .- model[:os_electrolyzer][t]) .*
-        (electrolyzer.P_standby .* model[:c_electrolyzer])))
+        model[:p_DAM_buy][t] -
+        (model[:p_DAM_sell][t] +
+            ((1 - model[:os_electrolyzer][t]) *
+                (electrolyzer.P_standby * model[:c_electrolyzer]))
+        )
     )
 end
 
@@ -380,7 +463,7 @@ function lowerbound_electrolyzer(
     )
 end
 
-function getenergyin(
+function energygenerated(
     model::JuMP.Model,
     timeseries::Timeseries_Data,
     t::Int64
@@ -390,7 +473,7 @@ function getenergyin(
         model[:c_wind_on]*timeseries.wind_on[t] +
         model[:c_wind_off]*timeseries.wind_off[t]
     )
-    return generation + model[:p_DAM_buy][t]
+    return generation
 end
 
 function getmarketvalue(
@@ -400,6 +483,18 @@ function getmarketvalue(
     t::Int64
 )
     return model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) - model[:p_DAM_sell][t] * timeseries.price_DAM[t]
+end
+
+function compressorconstant(
+    cd::Dict #Compressor dictionary
+)
+    R = 8.31446261815324 #J/(mol K)
+    gamma = 1.4
+    K = (
+        ((R*cd["inlet_temperature"])/(2*(gamma-1)*cd["efficiency"]))*
+        ((cd["outlet_pressure"]/cd["inlet_pressure"])^((gamma-1)/gamma) - 1)
+    )
+    return K
 end
 
 """
@@ -441,40 +536,54 @@ function solveoptimizationmodel(
     # Setting the time limit and the mip gap
     set_time_limit_sec(model, time_limit)
     set_optimizer_attribute(model, "MIPgap", mip_gap)
-    set_optimizer_attribute(model, "DualReductions", 0)
+    # set_optimizer_attribute(model, "DualReductions", 0)
 
     # Defining the most commonly used parameternames for readability
-    simulation_length = parameters.scenario.simulation_length
-    hourly_target = parameters.scenario.hourly_target
-    etc_length = parameters.scenario.etc_length
-    htc_length = parameters.scenario.htc_length
-    flexrange = parameters.scenario.flexrange
-    timeseries = parameters.timeseries
-    lambda_TSO = parameters.scenario.lambda_TSO
-    electrolyzer = parameters.components["electrolyzer"]
-    storage = parameters.components["storage"]
+    scenario = parameters.scenario
+    simulation_length = scenario.simulation_length
+    hourly_target = scenario.hourly_target
+    etc_length = scenario.etc_length
+    htc_length = scenario.htc_length
+    flexrange = scenario.flexrange
+    lambda_TSO = scenario.lambda_TSO
+
+    components = parameters.components
+    electrolyzer = components["electrolyzer"]
+    storage = components["storage"]
     
+    timeseries = parameters.timeseries
+
     hourlymatching = (etc_length==1)
     println("Hourly matching: ", hourlymatching)
-    maxcapgenerators = 100
 
     # Defining the variables
         # Design (these caps are currently arbitrary, should be added to json file)
     @variables(model, begin
-        0 <= c_solar <= maxcapgenerators #Solar capacity
-        0 <= c_wind_on <= maxcapgenerators #Onshore capacity
-        0 <= c_wind_off <= maxcapgenerators #Offshore capacity
+        0 <= c_solar #Solar capacity
+        0 <= c_wind_on #Onshore capacity
+        0 <= c_wind_off #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
+        0 <= c_compressor
     end)
+
+    if !isa(scenario.maxcapgeneration, Bool)
+        @constraint(model, c_solar + c_wind_on + c_wind_off <= scenario.maxcapgeneration)
+    end
+
+    # Limiting capacities
+    for (string, symbol) in zip(("solar", "wind_on", "wind_off"), (:c_solar, :c_wind_on, :c_wind_off))
+        if !isa(components[string].maxcapacity, Bool)
+            @constraint(model, model[symbol] <= components[string].maxcapacity)
+        end
+    end
 
     # Optional constraints for fixed capacities
     # @constraints(model, begin
-    #     c_solar == 37.4322
-    #     c_wind_on == 15.0799
-    #     c_wind_off == 0
-    #     c_electrolyzer == 6.00945
-    #     c_storage == 2918.96
+    #     c_solar == 10
+    #     c_wind_on == 0
+    #     c_wind_off == 30
+    #     c_electrolyzer == 7
     # end)
 
         # Operation
@@ -496,20 +605,7 @@ function solveoptimizationmodel(
             [t in 1:simulation_length],
             p_DAM_buy[t] <= c_electrolyzer*electrolyzer.P_standby
         )
-    # else
-    #     @constraint(
-    #         model,
-    #         [t in 1:simulation_length],
-    #         p_DAM_buy[t] <= 3*maxcapgenerators
-    #     )
     end
-
-    # #Putting bounds on buying and selling
-    # @constraint(
-    #     model,
-    #     [t in 1:simulation_length],
-    #     p_DAM_sell[t] <= 3*maxcapgenerators
-    # )
 
         #Temporal correlation constraint
     @constraint(
@@ -546,7 +642,7 @@ function solveoptimizationmodel(
         model, 
         [t in 1:simulation_length], 
         (p_electrolyzer[t] + p_DAM_sell[t] == 
-        getenergyin(model, timeseries, t))
+        energygenerated(model, timeseries, t) + p_DAM_buy[t])
     )
 
         #  Upper bound electrolyzer power
@@ -555,7 +651,7 @@ function solveoptimizationmodel(
         [t in 1:simulation_length], 
         (p_electrolyzer[t] <= 
         upperbound_electrolyzer(model, electrolyzer, t))
-    ) 
+    )
 
         #  Lower bound electrolyzer power
     @constraint(
@@ -634,6 +730,62 @@ function solveoptimizationmodel(
     optimize!(model)
 
     return model
+end
+
+function unconstrainedmodel(
+    parameters::Parameter_Data, 
+    time_limit::Int64,
+    mip_gap::Float64;
+)
+    # Defining the model
+    model = Model(Gurobi.Optimizer)
+
+    # Setting the time limit and the mip gap
+    set_time_limit_sec(model, time_limit)
+    set_optimizer_attribute(model, "MIPgap", mip_gap)
+    # set_optimizer_attribute(model, "DualReductions", 0)
+
+    # Defining some variables for visibility
+    scenario = parameters.scenario
+    components = parameters.components
+    timeseries = parameters.timeseries
+
+    simulation_length = scenario.simulation_length
+
+    @variables(model, begin
+        0 <= c_solar #Capacity of solar power plant
+        0 <= c_wind_on #Capacity of wind power plant
+        0 <= c_wind_off #Capacity of wind power plant
+    end)
+
+    # Limitting max capacities
+    if !isa(scenario.maxcapgeneration, Bool)
+        @constraint(model, c_solar + c_wind_on + c_wind_off == scenario.maxcapgeneration)
+    end
+
+    # Limiting individual capacities
+    for (string, symbol) in zip(("solar", "wind_on", "wind_off"), (:c_solar, :c_wind_on, :c_wind_off))
+        if !isa(components[string].maxcapacity, Bool)
+            @constraint(model, model[symbol] <= components[string].maxcapacity)
+        end
+    end
+    
+    capacitycomponentpairs = zip(
+        (c_solar, c_wind_on, c_wind_off),
+        (components["solar"], components["wind_on"], components["wind_off"])
+    )
+
+    @objective(
+        model,
+        Min,
+        sum(getcomponentcosts(capacity, scenario, component) for (capacity, component) in capacitycomponentpairs) - 
+        sum(timeseries.price_DAM[t] * energygenerated(model, timeseries, t) for t in 1:simulation_length)
+    )
+
+    optimize!(model)
+
+    return model
+
 end
 
 """
@@ -734,13 +886,14 @@ function savedata(
     CSV.write(filename, combined_data)
 end
 
-function addLCOH(
-    results::DataFrame
+function addoutcometodf(
+    results::DataFrame,
+    outcome::Tuple{Char, Int}
 )
     LCOH = []
     for (i, result) in enumerate(results[:, "Results"])
         if isa(result, Dict)
-            append!(LCOH, result[:outcome_data][2, :cost]) 
+            append!(LCOH, result[:outcome_data][outcome[2], outcome[1]]) 
         elseif isnan(result)
             append!(LCOH, NaN)
         end 
@@ -761,10 +914,12 @@ function makeplot(
     deleteat!(flows, zeros)
     deleteat!(labels, zeros)
 
+
     # Taking flow subsets 
     if subsetsize != false
         println("Taking a subset of the flows")
-        flows = map(x->x[1:subsetsize], flows)
+        start = round(Int, length(flows[1])/2)
+        flows = map(x->x[start:start+subsetsize], flows)
         if isa(twindata, Array)
             twindata = twindata[1:subsetsize]
         end
@@ -778,17 +933,19 @@ function makeplot(
     # Adding legend
     axislegend(ax1; position=:lt)
 
+    ax2 = Axis(fig[1,1], yaxisposition=:right)
+    hidespines!(ax2)
+    hidexdecorations!(ax2)
+
     # Adding a twin axis if needed
     if isa(twindata, Array)
-        ax2 = Axis(fig[1,1], yaxisposition=:right)
-        hidespines!(ax2)
-        hidexdecorations!(ax2)
         series!(ax2, [twindata], labels=[twinlabel], solid_color=:black, linestyle=:dash)
         axislegend(ax2; position=:rt)
+        return fig, ax1, ax2
     end
 
 
-    return fig, ax1
+    return fig, ax1, ax2
 end
 
 function powerfig(
@@ -797,11 +954,11 @@ function powerfig(
     twindata::Union{Array{Float64,1}, Bool}=false,
     subsetsize::Union{Int64, Bool}=false
 )
-    fig, ax1 = makeplot(powerflow, powerlabels; twindata=twindata, subsetsize=subsetsize)
+    fig, ax1, ax2 = makeplot(powerflow, powerlabels; twindata=twindata, twinlabel="DAM Price", subsetsize=subsetsize)
     ax1.title = "Power flows"
     ax1.ylabel ="Power [MW]"
     ax1.xlabel = "Time [h]"
-    #ax2[:set_ylabel]("DAM price [€/MWh]")
+    ax2.ylabel = "DAM price [€/MWh]"
     return fig
 end
 
@@ -811,32 +968,29 @@ function hydrogenfig(
     twindata::Union{Array{Float64,1}, Bool}=false,
     subsetsize::Union{Int64, Bool}=false
 )
-    fig, ax1 = makeplot(hydrogenflow, hydrogenlabels; twindata=twindata, twinlabel="SOC", subsetsize=subsetsize)
-    ax1.title = "hydrogen flows"
-    ax1.ylabel ="hydrogen [kg]"
+    fig, ax1, ax2 = makeplot(hydrogenflow, hydrogenlabels; twindata=twindata, twinlabel="SOC", subsetsize=subsetsize)
+    ax1.title = "Hydrogen flows"
+    ax1.ylabel ="Hydrogen massflow [kg]"
     ax1.xlabel = "Time [h]"
-    #ax2[:set_ylabel]("DAM price [€/MWh]")
+    ax2.ylabel = "Hydrogen stored [kg]"
     return fig
 end
 
 function plotdata(
-    data::Dict{Symbol,DataFrame}
+    data::Dict{Symbol,DataFrame};
+    parameters=false
 )
-    # set_theme!(;
-    #     resolution=(800, 600),
-    #     background_color="white",
-    #     fontsize=8,
-    #     Axis(;
-    #         xgridstyle=:dash,
-    #         ygridstyle=:dash,
-    #         ),
-    # )
     powerdata = data[:power_data]
     hydrogendata = data[:hydrogen_data]
 
     # Collecting all the power data
     powerlabels = ["Solar", "Wind (onshore)", "Wind (offshore)", "Buy", "Sell", "Electrolyzer"]
     powerflow = [powerdata[:, datapoint] for datapoint in [:p_solar, :p_wind_on, :p_wind_off, :p_DAM_buy, :p_DAM_sell, :p_electrolyzer]]
+    if !(parameters isa Bool)
+        damprices = powerdata[:, :p_DAM_sell]
+    else 
+        damprices = zeros(length(powerdata[:, :p_solar]))
+    end
 
     # Collecting all the power data
     hydrogenlabels = ["Electrolyzer", "Storage in", "Storage out", "Demand"]
@@ -879,9 +1033,25 @@ function make3dplot(
     fig
 end
 
-function makeheatmap(
+function plotsensitivity(
     results::DataFrame;
-    normalized::Bool=true
+    normalized::Bool=true,
+    LCXY::Array{Char, 1}=["Variable", "Component", "Adjustment", "LCOH"]
+)
+    L = unique(results[LCXY[1]])
+    C = []
+    C = [[component[LCXY[4]]]]
+    X=sort(unique(results[X]))
+
+end
+
+
+function plotheatmap(
+    results::DataFrame;
+    C::Symbol=:LCOH,
+    Clabel::String="LCOH [€/kg]",
+    normalized::Bool=false,
+    percentage::Bool=false
 )
     X=:etc_length
     Y2=:flexrange
@@ -910,9 +1080,13 @@ function makeheatmap(
     Xvals = repeat(range(1, Xscenarios), inner=convert(Int64,Yscenarios))
     Yvals = repeat(range(1, Yscenarios), convert(Int64,Xscenarios))
 
-    Cvals = [convert(Float32, x) for x in (results[:, :LCOH])]
+    Cvals = [convert(Float32, x) for x in (results[:, C])]
+    if percentage
+        Cvals = [Cvals[i]/results[:total_cost]]
+    end
     if normalized
         Cvals = Cvals./mean(filter(!isnan, Cvals))
+        Clabel = "Deviation from the mean [%]"
     end
 
     fig = Figure()
@@ -942,19 +1116,7 @@ function makeheatmap(
         yticksize=0
     )
 
-    # Calculate colorbar range
-    # Find maximum deviation from mean and round to nearest 0.1
-    maxdeviation = ceil(maximum(abs.(Cvals.-1).*100))
-    colorbarrange = (100-maxdeviation, 100+maxdeviation)./100
-    colorbarticks = (100-maxdeviation:10:100+maxdeviation)./100
-    colorbarticklabels = ["$(convert(Int64, round(100*tick)))%" for tick in colorbarticks]
-
-    println(maxdeviation)
-    println(colorbarrange)
-    println([x for x in colorbarticks])
-    println(colorbarticklabels)
-
-    hm = heatmap!(Xvals, Yvals, Cvals, colormap=cgrad(:RdYlGn_8, rev=true), colorrange=colorbarrange, nan_color = :snow2)
+    hm = heatmap!(Xvals, Yvals, Cvals, colormap=cgrad(:RdYlGn_8, rev=true), nan_color = :snow2)
 
     ax2=Axis(
         fig[1, 1],
@@ -982,7 +1144,7 @@ function makeheatmap(
     hidespines!(ax2)
     hidexdecorations!(ax2)
     
-    Colorbar(fig[:,2], hm, label="Deviations from mean [%]", ticks=(colorbarticks, colorbarticklabels))
+    Colorbar(fig[:,2], hm, label=Clabel)
 fig
 end
 
@@ -1036,7 +1198,7 @@ function optimizeptx(
     if verbose
         println("Parameters: ", parameters)
     end
-    solvedmodel = solveoptimizationmodel(parameters, 120, 0.05)
+    solvedmodel = solveoptimizationmodel(parameters, 900, 0.05)
     if termination_status(solvedmodel) == MOI.OPTIMAL
         println("Optimal solution found.")
         results = getresults(solvedmodel, parameters, verbose)
@@ -1072,7 +1234,7 @@ function optimizeptx(
         getresults(
             solveoptimizationmodel(
                 parameters, 
-                120, 
+                300, 
                 0.05
             ), 
             parameters, 
