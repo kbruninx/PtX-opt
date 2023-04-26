@@ -1,7 +1,7 @@
 {
     "scenarios": {
         "name": "Example_NL",
-        "simulation_days": 84,
+        "simulation_days": 90,
         "hourly_target": 100,
         "etc_length": [672, 168, 24, 1],
         "htc_length": [672, 168, 24, 1],
@@ -46,19 +46,19 @@
             "fixopex": 0.02,
             "lifetime": 15,
             "maxcapacity": false,
-            "inlet_temperature": 40,
+            "inlet_temperature": 313,
             "inlet_pressure": 30,
             "outlet_pressure": 200,
             "efficiency": 0.75
         },
         "storage": {
             "systemprice": 378,
-            "fixopex": 0.07,
+            "fixopex": 0.02,
             "lifetime": 30,
             "maxcapacity": false,
             "efficiency": 0.95,
             "soc_init": 0.5
         }
     },
-    "timeseriesfile": "NL_Timeseriesdata2021.csv"
+    "timeseriesfiles": "NL_Timeseriesdata2021.csv"
 }

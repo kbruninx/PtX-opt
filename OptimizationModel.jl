@@ -100,12 +100,13 @@ struct Timeseries_Data
     wind_on::Array{Float64,1}
     wind_off::Array{Float64,1}
     price_DAM::Array{Float64,1}
+    weightmatrix::Array{Float64,2}
 end
 
 struct Parameter_Data
     # Parameter data structure, containing all the parameter data needed for the optimization model
     scenario::Scenario_Data
-    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data}}
+    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data, Compressor_Data}}
     timeseries::Timeseries_Data
 end
 
@@ -328,7 +329,7 @@ function componentsfromdict(dict)
     )
     out["compressor"] = Compressor_Data(
         out["compressor"],
-        compressorconstant(dict["compressor"])
+        compressorconstant(dict["compressor"])/(1e3 * 3.6e3) # constant is kWs/kg -> MWh/kg
     )
     return out
 end
@@ -341,7 +342,7 @@ function timeseriesfromdict(
     timeseries_df = CSV.read(joinpath(home_dir, filename), DataFrame)
     return Timeseries_Data(
         (selectsubset(timeseries_df[:, category], scenario_dict["simulation_days"])
-        for category in ["Solar_profile", "Wind_on_profile", "Wind_off_profile", "Dayahead_price"])...
+        for category in ["Solar", "WindOnshore", "WindOffshore", "Pricerice"])...
     )
 end
 
@@ -371,12 +372,14 @@ function getinvestmentcosts(
     parameters::Parameter_Data
 )
     sum = 0
+    c_compressor = model[:c_electrolyzer]*parameters.components["electrolyzer"].efficiency*parameters.components["compressor"].constant
     capacitycomponentpairs = zip(
         (model[char] for char in [:c_solar, :c_wind_on, :c_wind_off, :c_electrolyzer, :c_storage]),
         (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
     )
     for (capacity, component) in capacitycomponentpairs
         sum += getcomponentcosts(capacity, parameters.scenario, component)
+        #sum += getcomponentcosts(c_compressor, parameters.scenario, parameters.components["compressor"])
     end
     return sum
 end
@@ -415,26 +418,30 @@ end
 
 
 function getelectrolyzerproduction(
-    model::JuMP.Model,
-    electrolyzer::Electrolyzer_Data,
-    t::Int64
+    p_electrolyzer,
+    os_electrolyzer,
+    electrolyzer::Electrolyzer_Data
 )
     return (
         electrolyzer.efficiency * 
-        model[:os_electrolyzer][t] * 
-        model[:p_electrolyzer][t]
+        p_electrolyzer * 
+        os_electrolyzer
     )
 end
 
 #The net power consumption from the grid, which excludes standby and compressor consumption
 function getnetpower(
     model::JuMP.Model,
-    electrolyzer::Electrolyzer_Data,
+    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data, Compressor_Data}},
     t::Int64
 )
+    electrolyzer = components["electrolyzer"]
+    compressor = components["compressor"]
     return (
         model[:p_DAM_buy][t] -
-        (model[:p_DAM_sell][t] +
+        (
+            model[:p_DAM_sell][t] +
+            model[:os_electrolyzer][t]*model[:p_electrolyzer][t]*electrolyzer.efficiency*compressor.constant+
             ((1 - model[:os_electrolyzer][t]) *
                 (electrolyzer.P_standby * model[:c_electrolyzer]))
         )
@@ -474,6 +481,25 @@ function energygenerated(
         model[:c_wind_off]*timeseries.wind_off[t]
     )
     return generation
+end
+
+function energyconsumed(
+    model::JuMP.Model,
+    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data, Compressor_Data}},
+    t::Int64
+)
+    electrolyzer = components["electrolyzer"]
+    compressor = components["compressor"]
+    p_elec = model[:p_electrolyzer][t]
+    os_elec = model[:os_electrolyzer][t]
+    return (
+        p_elec+
+        (getelectrolyzerproduction(
+            p_elec, 
+            os_elec, 
+            electrolyzer)*
+        compressor.constant)
+    )
 end
 
 function getmarketvalue(
@@ -536,7 +562,7 @@ function solveoptimizationmodel(
     # Setting the time limit and the mip gap
     set_time_limit_sec(model, time_limit)
     set_optimizer_attribute(model, "MIPgap", mip_gap)
-    # set_optimizer_attribute(model, "DualReductions", 0)
+    set_optimizer_attribute(model, "DualReductions", 0)
 
     # Defining the most commonly used parameternames for readability
     scenario = parameters.scenario
@@ -550,6 +576,7 @@ function solveoptimizationmodel(
     components = parameters.components
     electrolyzer = components["electrolyzer"]
     storage = components["storage"]
+    compressor = components["compressor"]
     
     timeseries = parameters.timeseries
 
@@ -564,7 +591,6 @@ function solveoptimizationmodel(
         0 <= c_wind_off #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
-        0 <= c_compressor
     end)
 
     if !isa(scenario.maxcapgeneration, Bool)
@@ -611,7 +637,7 @@ function solveoptimizationmodel(
     @constraint(
         model, 
         [k in (1:etc_length:simulation_length)], 
-        (sum((getnetpower(model, electrolyzer,t)) for t in (k:(k+etc_length-1))) <= 
+        (sum((getnetpower(model, components,t)) for t in (k:(k+etc_length-1))) <= 
         0)
     )
     
@@ -641,7 +667,7 @@ function solveoptimizationmodel(
     @constraint(
         model, 
         [t in 1:simulation_length], 
-        (p_electrolyzer[t] + p_DAM_sell[t] == 
+        (energyconsumed(model, components, t) + p_DAM_sell[t] == 
         energygenerated(model, timeseries, t) + p_DAM_buy[t])
     )
 
@@ -665,7 +691,7 @@ function solveoptimizationmodel(
     @constraint(
         model,
         [t in 1:simulation_length],
-        (h_electrolyzer[t] == getelectrolyzerproduction(model, electrolyzer, t))
+        (h_electrolyzer[t] == getelectrolyzerproduction(p_electrolyzer[t], os_electrolyzer[t], electrolyzer))
     )
 
         # Hydrogen storage capacity
@@ -678,14 +704,14 @@ function solveoptimizationmodel(
         # Hydrogen storage initialization
     @constraint(
         model,
-        (h_storage_soc[1] == storage.soc_init*c_storage + h_storage_in[1]*storage.efficiency - h_storage_out[1])
+        (h_storage_soc[1] == storage.soc_init*c_storage + h_storage_in[1] - h_storage_out[1])
     )
     
         # Electrolyzer hydrogen storage state of charge
     @constraint(
         model,
         [t in 2:simulation_length],
-        (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t]*storage.efficiency - h_storage_out[t])
+        (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t] - h_storage_out[t])
     )
 
         # Hydrogen storage final state of charge equal to initial state of charge
@@ -734,15 +760,13 @@ end
 
 function unconstrainedmodel(
     parameters::Parameter_Data, 
-    time_limit::Int64,
-    mip_gap::Float64;
+    time_limit::Int64
 )
     # Defining the model
     model = Model(Gurobi.Optimizer)
 
     # Setting the time limit and the mip gap
     set_time_limit_sec(model, time_limit)
-    set_optimizer_attribute(model, "MIPgap", mip_gap)
     # set_optimizer_attribute(model, "DualReductions", 0)
 
     # Defining some variables for visibility
@@ -808,8 +832,9 @@ This function returns the results of the optimization model.
 """
 function getresults(
     model::JuMP.Model, 
-    parameters::Parameter_Data,
-    verbose::Bool
+    parameters::Parameter_Data;
+    verbose::Bool,
+    opportunity_cost::Float64 = 0
 )
     if termination_status(model) != MOI.OPTIMAL
         return NaN
@@ -855,18 +880,21 @@ function getresults(
     )
 
     # Extracting outcomes
-    outcome_data = DataFrame(name = String[], capacity= Any[], cost = Any[])
-    push!(outcome_data, ("Total costs", missing, objective_value(model)))
-    push!(outcome_data, ("Average cost of Hydrogen", missing, objective_value(model)/parameters.scenario.production_target))
-    push!(outcome_data, ("Electrolyzer capacity factor", mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), missing))
+    outcome_data = Dict{String, Union{Float64, Dict{String, Float64}}}(
+        "Total costs" => objective_value(model)-opportunity_cost,
+        "Average cost of Hydrogen" => (objective_value(model)-opportunity_cost)/parameters.scenario.production_target,
+        "Electrolyzer capacity factor" => mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer])
+    )
+
     for (capacity, component) in capacitycomponentpairs
-        push!(outcome_data, (name(component), capacity, getcomponentcosts(capacity, parameters.scenario, component)))
+        outcome_data["$(name(component))"] = Dict("capacity"=> capacity, "cost" => getcomponentcosts(capacity, parameters.scenario, component))
     end
-    push!(outcome_data, ("Total profit power market", missing, sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))))
+
+    outcome_data["Total profit power market"] = sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))
 
     # Printing the results if verbose
     if verbose
-        println(outcome_data)
+        print(json(outcome_data,4))
     end
 
     return Dict(
@@ -888,17 +916,18 @@ end
 
 function addoutcometodf(
     results::DataFrame,
-    outcome::Tuple{Char, Int}
+    outcomes::Vector{Union{String}}
 )
-    LCOH = []
-    for (i, result) in enumerate(results[:, "Results"])
-        if isa(result, Dict)
-            append!(LCOH, result[:outcome_data][outcome[2], outcome[1]]) 
-        elseif isnan(result)
-            append!(LCOH, NaN)
-        end 
+    for outcome in outcomes
+        data = [result[:outcome_data][outcome] for result in results[:, "Results"]]
+        if data[1] isa Dict
+            for key in keys(data[1])
+                insertcols!(results, "$(outcome)_$(key)" => [subdata[key] for subdata in data])
+            end
+        else
+            insertcols!(results, "$(outcome)" => data)
+        end
     end
-    results[:, "LCOH"] = LCOH
     return results
 end
 
@@ -1191,17 +1220,28 @@ This function caries out the optimization. This method works on the Parameter_Da
 """
 function optimizeptx(
     parameters::Parameter_Data, 
-    verbose::Bool=true,
+    verbose::Bool=true;
     savepath::String="$(home_dir)/Results",
-    savecsv::Bool=true
+    savecsv::Bool=true,
+    opportunity::Bool=false
 )
     if verbose
         println("Parameters: ", parameters)
     end
     solvedmodel = solveoptimizationmodel(parameters, 900, 0.05)
+    if opportunity
+        solvedopportunity = unconstrainedmodel(parameters, 60)
+        opportunity_cost = objective_value(solvedopportunity)
+    else
+        opportunity_cost = 0
+    end
     if termination_status(solvedmodel) == MOI.OPTIMAL
         println("Optimal solution found.")
-        results = getresults(solvedmodel, parameters, verbose)
+        results = getresults(
+            solvedmodel, 
+            parameters, 
+            verbose=verbose, 
+            opportunity_cost=opportunity_cost)
     else
         throw(ErrorException("Optimal solution not found."))
     end
@@ -1238,7 +1278,7 @@ function optimizeptx(
                 0.05
             ), 
             parameters, 
-            verbose
+            verbose=verbose
         ) for parameters in parameterdf[:, "Parameters"]
     ]
     return addLCOH(solutiondataframe)
@@ -1247,9 +1287,10 @@ end
 
 function mainscript(
     parameterfilename::String,
-    verbose::Bool=true,
+    verbose::Bool=true;
     savepath::String="$(home_dir)/Results",
-    savecsv::Bool=true
+    savecsv::Bool=true,
+    opportunity::Bool=false
 )   
     parameters = fetchparameterdata(parameterfilename)
 

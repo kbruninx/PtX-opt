@@ -3,9 +3,9 @@
         "name": "Example_2021",
         "simulation_days": 84,
         "hourly_target": 100,
-        "etc_length": 168,
-        "htc_length": 168,
-        "flexrange": 0.2,
+        "etc_length": 336,
+        "htc_length": 336,
+        "flexrange": 1,
         "lambda_TSO": 10,
         "discount_rate": 0.05,
         "maxcapgeneration": 100
@@ -34,9 +34,9 @@
             "maxcapacity": false
         },
         "electrolyzer": {
-            "systemprice": 1000000,
+            "systemprice": 1400000,
             "fixopex": 0.02,
-            "lifetime": 15,
+            "lifetime": 20,
             "maxcapacity": false,
             "efficiency": 18.5,
             "P_min": 0.1,
@@ -46,17 +46,17 @@
             "fixopex": 0.02,
             "lifetime": 15,
             "maxcapacity": false,
-            "inlet_temperature": 40,
+            "inlet_temperature": 313,
             "inlet_pressure": 30,
             "outlet_pressure": 200,
             "efficiency": 0.75
         },
         "storage": {
-            "systemprice": 190,
-            "fixopex": 0.07,
+            "systemprice": 378,
+            "fixopex": 0.02,
             "lifetime": 30,
             "maxcapacity": false,
-            "efficiency": 0.78,
+            "efficiency": 0.95,
             "soc_init": 0.5
         }
     },
