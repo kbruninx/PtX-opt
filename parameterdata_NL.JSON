@@ -1,7 +1,6 @@
 {
     "scenarios": {
         "name": "Example_2021",
-        "simulation_days": 84,
         "hourly_target": 100,
         "etc_length": 24,
         "htc_length": 336,
@@ -61,6 +60,7 @@
         }
     },
     "timeseriesfiles": {
-        "": "NL_Timeseriesdata2021.csv"
+        "timeseriesfile": "NL_Representativedays90.csv",
+        "weightmatrixfile": "NL_Weightmatrix90.csv"
     }
 }

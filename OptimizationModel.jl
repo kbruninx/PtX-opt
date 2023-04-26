@@ -21,6 +21,7 @@ using JSON
 using ReusePatterns
 using Statistics
 using CairoMakie
+using Tables
 CairoMakie.activate!(type = "svg")
 
 # Directory
@@ -30,13 +31,9 @@ const home_dir = @__DIR__
 # Useful structures
 struct Scenario_Data
     name::String
-    # Timeframe
-    simulation_days::Int64
-    simulation_length::Int64 # length in hourly timesteps
     # Financial parameters
     discount_rate::Float64
     lambda_TSO::Float64 # TSO penalty factor
-    timefactor::Float64 # Annual to simulation length conversion factor
     # Hydrogen target
     hourly_target::Float64 # kg/h of hydrogen production
     production_target::Float64 # kg of hydrogen production
@@ -113,11 +110,8 @@ end
 #Printing methods
 Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Name = $(s.name),
-    Simulation days = $(s.simulation_days),
-    Simulation length = $(s.simulation_length),
     Discount rate = $(s.discount_rate),
     TSO tariff = $(s.lambda_TSO),
-    Timefactor = $(s.timefactor),
     Hourly production target = $(s.hourly_target),
     Total production target = $(s.production_target),
     Electrical Temporal Correlation length = $(s.etc_length),
@@ -173,7 +167,7 @@ function fetchparameterdata(
     d = JSON.parsefile(parameterfile)
     scenarios = combinescenarios(d["scenarios"])
     components = combinecomponents(d["sensitivity_analysis"], d["components"])
-    timeseries = timeseriesfromdict(d["timeseriesfile"], d["scenarios"])
+    timeseries = timeseriesfromdict(d["timeseriesfiles"])
 
     # If it is only a case study, return a Parameter_Data struct
     if scenarios isa Scenario_Data && components isa Dict
@@ -291,13 +285,9 @@ end
 function scenariofromdict(dict)
     return Scenario_Data(
         dict["name"],
-        dict["simulation_days"],
-        dict["simulation_days"]*24,
         dict["discount_rate"],
         dict["lambda_TSO"],
-        dict["simulation_days"]*24/(365*24),
         dict["hourly_target"],
-        dict["hourly_target"]*dict["simulation_days"]*24,
         dict["etc_length"],
         dict["htc_length"],
         dict["flexrange"],
@@ -336,26 +326,14 @@ end
 
 # Timeseries manipulation
 function timeseriesfromdict(
-    filename::String, 
-    scenario_dict::Dict
+        timeseriesfiles::Dict{String, Any}
 )
-    timeseries_df = CSV.read(joinpath(home_dir, filename), DataFrame)
+    timeseries_df = CSV.read(joinpath(home_dir, timeseriesfiles["timeseriesfile"]), DataFrame)
+    weightmatrix = CSV.File(joinpath(home_dir, timeseriesfiles["weightmatrixfile"])) |> Tables.matrix
     return Timeseries_Data(
-        (selectsubset(timeseries_df[:, category], scenario_dict["simulation_days"])
-        for category in ["Solar", "WindOnshore", "WindOffshore", "Pricerice"])...
-    )
-end
-
-function selectsubset(
-    hourlyarray::Array{Float64,1}, 
-    numberofdays::Int64 
-)
-    outarray = []
-    for i in LinRange(24, length(hourlyarray), numberofdays)
-        ni = convert(Int64, round(i))
-        append!(outarray, hourlyarray[ni-23:ni])
-    end
-    return outarray
+        [timeseries_df[:, series] for series in ["Solar", "WindOnshore", "WindOffshore", "Price"]]...,
+        weightmatrix
+        )
 end
 
     #Financial calculations
@@ -387,12 +365,13 @@ end
 function getcomponentcosts(
     capacity::Union{VariableRef, Float64}, 
     scenario::Scenario_Data,
-    component
+    component::Union{Electrolyzer_Data, Storage_Data, Compressor_Data, Component_Data};
+    timefactor::Float64 = 1.0
 )
     crf = getcapitalrecoveryfactor(scenario.discount_rate, lifetime(component))
     return (
         systemprice(component)*capacity*
-        scenario.timefactor*
+        timefactor*
         (crf+fixopex(component))
     )
 end
@@ -523,6 +502,15 @@ function compressorconstant(
     return K
 end
 
+function rep_to_total(
+    repvals::Array{Float64, 1},
+    weightmatrix::Array{Float64, 2};
+    daily::Bool = false
+)
+    reparray = reshape(repvals, length(repvals)÷24, 24)
+    return reparray*weightmatrix
+end
+
 """
     
 
@@ -566,7 +554,6 @@ function solveoptimizationmodel(
 
     # Defining the most commonly used parameternames for readability
     scenario = parameters.scenario
-    simulation_length = scenario.simulation_length
     hourly_target = scenario.hourly_target
     etc_length = scenario.etc_length
     htc_length = scenario.htc_length
@@ -579,6 +566,8 @@ function solveoptimizationmodel(
     compressor = components["compressor"]
     
     timeseries = parameters.timeseries
+    representative_timesteps = size(timeseries.weightmatrix, 2)*24
+    total_timesteps = size(timeseries.weightmatrix, 1)*24
 
     hourlymatching = (etc_length==1)
     println("Hourly matching: ", hourlymatching)
@@ -614,21 +603,21 @@ function solveoptimizationmodel(
 
         # Operation
     @variables(model, begin
-        0 <= p_DAM_sell[1:simulation_length] #Power sold to the DAM
-        0 <= p_DAM_buy[1:simulation_length] # Power bought from the DAM
-        0 <= p_electrolyzer[1:simulation_length] #Electrolyzer power
-        os_electrolyzer[1:simulation_length], Bin #Electrolyzer on/standby status
-        0 <= h_electrolyzer[1:simulation_length] #Electrolyzer hydrogen production
-        0 <= h_storage_soc[1:simulation_length] #Electrolyzer hydrogen storage state of charge
-        0 <= h_storage_in[1:simulation_length] #Electrolyzer hydrogen storage input
-        0 <= h_storage_out[1:simulation_length] #Electrolyzer hydrogen storage output
-        0 <= h_demand[1:simulation_length] #Hydrogen output
+        0 <= p_DAM_sell[1:representative_timesteps] #Power sold to the DAM
+        0 <= p_DAM_buy[1:representative_timesteps] # Power bought from the DAM
+        0 <= p_electrolyzer[1:representative_timesteps] #Electrolyzer power
+        os_electrolyzer[1:representative_timesteps], Bin #Electrolyzer on/standby status
+        0 <= h_electrolyzer[1:representative_timesteps] #Electrolyzer hydrogen production
+        0 <= h_storage_soc[1:representative_timesteps] #Electrolyzer hydrogen storage state of charge
+        0 <= h_storage_in[1:representative_timesteps] #Electrolyzer hydrogen storage input
+        0 <= h_storage_out[1:representative_timesteps] #Electrolyzer hydrogen storage output
+        0 <= h_demand[1:representative_timesteps] #Hydrogen output
     end)
 
     if hourlymatching
         @constraint(
             model,
-            [t in 1:simulation_length],
+            [t in 1:representative_timesteps],
             p_DAM_buy[t] <= c_electrolyzer*electrolyzer.P_standby
         )
     end
@@ -636,7 +625,7 @@ function solveoptimizationmodel(
         #Temporal correlation constraint
     @constraint(
         model, 
-        [k in (1:etc_length:simulation_length)], 
+        [k in (1:etc_length:representative_timesteps)], 
         (sum((getnetpower(model, components,t)) for t in (k:(k+etc_length-1))) <= 
         0)
     )
@@ -652,13 +641,13 @@ function solveoptimizationmodel(
             # Upper bound electrolyzer hydrogen storage input, which should never exceed the max rated power of the electrolyzer
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         h_storage_in[t] <= hourly_target*5 #temporary fix, should be replaced by c_compressor or something of the sort
     )
 
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         h_storage_out[t] <= hourly_target*5
     )
 
@@ -666,7 +655,7 @@ function solveoptimizationmodel(
             # Energy balance
     @constraint(
         model, 
-        [t in 1:simulation_length], 
+        [t in 1:representative_timesteps], 
         (energyconsumed(model, components, t) + p_DAM_sell[t] == 
         energygenerated(model, timeseries, t) + p_DAM_buy[t])
     )
@@ -674,7 +663,7 @@ function solveoptimizationmodel(
         #  Upper bound electrolyzer power
     @constraint(
         model, 
-        [t in 1:simulation_length], 
+        [t in 1:representative_timesteps], 
         (p_electrolyzer[t] <= 
         upperbound_electrolyzer(model, electrolyzer, t))
     )
@@ -682,7 +671,7 @@ function solveoptimizationmodel(
         #  Lower bound electrolyzer power
     @constraint(
         model, 
-        [t in 1:simulation_length], 
+        [t in 1:representative_timesteps], 
         (p_electrolyzer[t] >= 
         lowerbound_electrolyzer(model, electrolyzer, t))
     )
@@ -690,14 +679,14 @@ function solveoptimizationmodel(
         # Electrolyzer hydrogen production
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         (h_electrolyzer[t] == getelectrolyzerproduction(p_electrolyzer[t], os_electrolyzer[t], electrolyzer))
     )
 
         # Hydrogen storage capacity
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         (h_storage_soc[t] <= c_storage)
     )
     
@@ -710,46 +699,52 @@ function solveoptimizationmodel(
         # Electrolyzer hydrogen storage state of charge
     @constraint(
         model,
-        [t in 2:simulation_length],
+        [t in 2:representative_timesteps],
         (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t] - h_storage_out[t])
     )
 
         # Hydrogen storage final state of charge equal to initial state of charge
     @constraint(
         model,
-        h_storage_soc[1] == h_storage_soc[simulation_length]
+        h_storage_soc[1] == h_storage_soc[representative_timesteps]
     )
    
         # Hydrogen output
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
     )
 
         # Hourly flexibility constraint
     @constraint(
         model,
-        [t in 1:simulation_length],
+        [t in 1:representative_timesteps],
         (1-(flexrange/(2-flexrange)))*hourly_target <=
         h_demand[t] <=
         (1+(flexrange/(2-flexrange)))*hourly_target 
     )
 
+    rep_demand = [h_demand[t] for t in 1:representative_timesteps]
+    tot_demand = rep_to_total(rep_demand, timeseries.weightmatrix)
+
         # Hydrogen temporal correlation constraint
     @constraint(
         model, 
-        [h in (1:htc_length:simulation_length)], 
+        [round(h) for h in 1:htc_length:total_timesteps], 
         (sum(h_demand[t] for t in (h:(h+htc_length-1))) == 
         htc_length*hourly_target)
     )
+
+    rep_revenues = [getmarketvalue(model, timeseries, lambda_TSO, t) for t in 1:representative_timesteps]
+    tot_revenues = rep_to_total(rep_revenues, timeseries.weightmatrix)
 
     # Defining the objective function
     @objective(
         model, 
         Min, 
         (getinvestmentcosts(model, parameters) +
-        sum(getmarketvalue(model, timeseries, lambda_TSO, t) for t in 1:simulation_length))
+        sum(tot_revenues))
     )
 
     # Solving the model
@@ -774,7 +769,8 @@ function unconstrainedmodel(
     components = parameters.components
     timeseries = parameters.timeseries
 
-    simulation_length = scenario.simulation_length
+    representative_timesteps = size(timeseries.weightmatrix, 2)*24
+    total_timesteps = size(timeseries.weightmatrix, 1)*24
 
     @variables(model, begin
         0 <= c_solar #Capacity of solar power plant
@@ -799,11 +795,14 @@ function unconstrainedmodel(
         (components["solar"], components["wind_on"], components["wind_off"])
     )
 
+    rep_revenue = [timeseries.price_DAM[t] * energygenerated(model, timeseries, t) for t in 1:representative_timesteps]
+    tot_revenue = rep_to_total(rep_revenue, timeseries.weightmatrix)
+
     @objective(
         model,
         Min,
         sum(getcomponentcosts(capacity, scenario, component) for (capacity, component) in capacitycomponentpairs) - 
-        sum(timeseries.price_DAM[t] * energygenerated(model, timeseries, t) for t in 1:simulation_length)
+        sum(tot_revenue)
     )
 
     optimize!(model)
@@ -834,7 +833,7 @@ function getresults(
     model::JuMP.Model, 
     parameters::Parameter_Data;
     verbose::Bool,
-    opportunity_cost::Float64 = 0
+    opportunity_cost::Union{Float64, Int} = 0
 )
     if termination_status(model) != MOI.OPTIMAL
         return NaN
@@ -1294,7 +1293,7 @@ function mainscript(
 )   
     parameters = fetchparameterdata(parameterfilename)
 
-    results = optimizeptx(parameters, verbose, savepath)
+    results = optimizeptx(parameters, verbose)
     #plotdf(results)
     return results
 end
