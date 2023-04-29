@@ -100,7 +100,6 @@ struct Timeseries_Data
     wind_on::Array{Float64,1}
     wind_off::Array{Float64,1}
     price_DAM::Array{Float64,1}
-    weightmatrix::Array{Float64,2}
 end
 
 struct Parameter_Data
@@ -342,7 +341,7 @@ function timeseriesfromdict(
     timeseries_df = CSV.read(joinpath(home_dir, filename), DataFrame)
     return Timeseries_Data(
         (selectsubset(timeseries_df[:, category], scenario_dict["simulation_days"])
-        for category in ["Solar", "WindOnshore", "WindOffshore", "Pricerice"])...
+        for category in ["Solar_profile", "Wind_on_profile", "Wind_off_profile", "Dayahead_price"])...
     )
 end
 
@@ -384,6 +383,7 @@ function getinvestmentcosts(
     return sum
 end
 
+
 function getcomponentcosts(
     capacity::Union{VariableRef, Float64}, 
     scenario::Scenario_Data,
@@ -407,6 +407,7 @@ function maxcapelectrolyzer(
     )
 end
 
+    #Calculates the maximum storage capacity in kg to improve computation time
 function maxcapstorage(
     parameters::Parameter_Data
 )
@@ -416,7 +417,7 @@ function maxcapstorage(
     )
 end
 
-
+    #Calculates the total amount of hydrogen produced by the electrolyzer in kg
 function getelectrolyzerproduction(
     p_electrolyzer,
     os_electrolyzer,
@@ -604,13 +605,13 @@ function solveoptimizationmodel(
         end
     end
 
-    # Optional constraints for fixed capacities
-    # @constraints(model, begin
-    #     c_solar == 10
-    #     c_wind_on == 0
-    #     c_wind_off == 30
-    #     c_electrolyzer == 7
-    # end)
+    #Optional constraints for fixed capacities
+    @constraints(model, begin
+        c_solar == 50
+        c_wind_on == 0
+        c_wind_off == 0
+        #c_electrolyzer == 12
+    end)
 
         # Operation
     @variables(model, begin
@@ -834,7 +835,7 @@ function getresults(
     model::JuMP.Model, 
     parameters::Parameter_Data;
     verbose::Bool,
-    opportunity_cost::Float64 = 0
+    opportunity_cost::Float64 = 0.0
 )
     if termination_status(model) != MOI.OPTIMAL
         return NaN
@@ -885,6 +886,10 @@ function getresults(
         "Average cost of Hydrogen" => (objective_value(model)-opportunity_cost)/parameters.scenario.production_target,
         "Electrolyzer capacity factor" => mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer])
     )
+    if opportunity_cost != 0.0
+        println("Opportunity cost: $(opportunity_cost)")
+        outcome_data["Unadjusted Average Cost"] = (objective_value(model))/parameters.scenario.production_target
+    end
 
     for (capacity, component) in capacitycomponentpairs
         outcome_data["$(name(component))"] = Dict("capacity"=> capacity, "cost" => getcomponentcosts(capacity, parameters.scenario, component))
@@ -1219,8 +1224,8 @@ This function caries out the optimization. This method works on the Parameter_Da
 
 """
 function optimizeptx(
-    parameters::Parameter_Data, 
-    verbose::Bool=true;
+    parameters::Parameter_Data;
+    verbose::Bool=true,
     savepath::String="$(home_dir)/Results",
     savecsv::Bool=true,
     opportunity::Bool=false
@@ -1229,11 +1234,13 @@ function optimizeptx(
         println("Parameters: ", parameters)
     end
     solvedmodel = solveoptimizationmodel(parameters, 900, 0.05)
+    println("Opportunity is $(opportunity)")
     if opportunity
         solvedopportunity = unconstrainedmodel(parameters, 60)
         opportunity_cost = objective_value(solvedopportunity)
+        println("Opportunity cost: ", opportunity_cost)
     else
-        opportunity_cost = 0
+        opportunity_cost = 0.0
     end
     if termination_status(solvedmodel) == MOI.OPTIMAL
         println("Optimal solution found.")
@@ -1261,7 +1268,7 @@ end
 """
 
 function optimizeptx(
-    parameterdf::DataFrame, 
+    parameterdf::DataFrame;
     verbose::Bool=true,
     savepath::String="$(home_dir)/Results",
     savecsv::Bool=true
@@ -1294,7 +1301,7 @@ function mainscript(
 )   
     parameters = fetchparameterdata(parameterfilename)
 
-    results = optimizeptx(parameters, verbose, savepath)
+    results = optimizeptx(parameters, verbose=verbose, savepath=savepath, savecsv=savecsv, opportunity=opportunity)
     #plotdf(results)
     return results
 end
