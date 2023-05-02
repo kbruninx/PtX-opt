@@ -1,9 +1,9 @@
 {
     "scenarios": {
         "name": "Example_2021",
-        "simulation_days": 84,
+        "simulation_days": 168,
         "hourly_target": 100,
-        "etc_length": 1,
+        "etc_length": 672,
         "htc_length": 336,
         "flexrange": 0.2,
         "lambda_TSO": 10,
