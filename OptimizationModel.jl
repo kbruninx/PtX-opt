@@ -607,22 +607,25 @@ function solveoptimizationmodel(
 
     #Optional constraints for fixed capacities
     # @constraints(model, begin
-    #     c_solar == 40
-    #     c_wind_on == 0
-    #     c_wind_off == 10
-    #     c_electrolyzer == 6.5
+    #     c_solar
+    #     c_wind_on
+    #     c_wind_off 
+    #     c_electrolyzer 
+    #     c_storage
     # end)
 
         # Operation
     @variables(model, begin
-        0 <= p_DAM_sell[1:simulation_length] #Power sold to the DAM
+        0 <= p_DAM_sell[1:simulation_length]#Power sold to the DAM
         0 <= p_DAM_buy[1:simulation_length] # Power bought from the DAM
         0 <= p_electrolyzer[1:simulation_length] #Electrolyzer power
+        0 <= p_compressor[1:simulation_length] #Compressor power
         os_electrolyzer[1:simulation_length], Bin #Electrolyzer on/standby status
         0 <= h_electrolyzer[1:simulation_length] #Electrolyzer hydrogen production
         0 <= h_storage_soc[1:simulation_length] #Electrolyzer hydrogen storage state of charge
         0 <= h_storage_in[1:simulation_length] #Electrolyzer hydrogen storage input
         0 <= h_storage_out[1:simulation_length] #Electrolyzer hydrogen storage output
+        0 <= h_demand_dir[1:simulation_length] #Hydrogen output directly without compression
         0 <= h_demand[1:simulation_length] #Hydrogen output
     end)
 
@@ -638,8 +641,12 @@ function solveoptimizationmodel(
     @constraint(
         model, 
         [k in (1:etc_length:simulation_length)], 
-        (sum((getnetpower(model, components,t)) for t in (k:(k+etc_length-1))) <= 
-        0)
+        (sum(
+            (p_DAM_buy[t] - (
+                p_DAM_sell[t] +
+                os_electrolyzer[t]*p_electrolyzer[t]*electrolyzer.efficiency*compressor.constant +
+                (1 - os_electrolyzer[t]) * (electrolyzer.P_standby * c_electrolyzer))) 
+        for t in (k:(k+etc_length-1))) <= 0)
     )
     
     # Defining the constraints
@@ -668,31 +675,39 @@ function solveoptimizationmodel(
     @constraint(
         model, 
         [t in 1:simulation_length], 
-        (energyconsumed(model, components, t) + p_DAM_sell[t] == 
-        energygenerated(model, timeseries, t) + p_DAM_buy[t])
+        (p_electrolyzer[t] + p_compressor[t] + p_DAM_sell[t] == (
+        c_solar*timeseries.solar[t] +
+        c_wind_on*timeseries.wind_on[t] +
+        c_wind_off*timeseries.wind_off[t] + 
+        p_DAM_buy[t]))
     )
 
         #  Upper bound electrolyzer power
     @constraint(
         model, 
         [t in 1:simulation_length], 
-        (p_electrolyzer[t] <= 
-        upperbound_electrolyzer(model, electrolyzer, t))
+        (p_electrolyzer[t] <= (
+        c_electrolyzer*os_electrolyzer[t] +
+        electrolyzer.P_standby*c_electrolyzer*(1-os_electrolyzer[t])))
     )
 
         #  Lower bound electrolyzer power
     @constraint(
         model, 
         [t in 1:simulation_length], 
-        (p_electrolyzer[t] >= 
-        lowerbound_electrolyzer(model, electrolyzer, t))
+        (p_electrolyzer[t] >= (
+        c_electrolyzer*electrolyzer.P_min*os_electrolyzer[t] +
+        electrolyzer.P_standby*c_electrolyzer*(1-os_electrolyzer[t])))
     )
 
         # Electrolyzer hydrogen production
     @constraint(
         model,
         [t in 1:simulation_length],
-        (h_electrolyzer[t] == getelectrolyzerproduction(p_electrolyzer[t], os_electrolyzer[t], electrolyzer))
+        (h_electrolyzer[t] == (
+            electrolyzer.efficiency * 
+            p_electrolyzer[t] * 
+            os_electrolyzer[t]))
     )
 
         # Hydrogen storage capacity
@@ -720,12 +735,26 @@ function solveoptimizationmodel(
         model,
         h_storage_soc[1] == h_storage_soc[simulation_length]
     )
-   
-        # Hydrogen output
+            
+        # Compressor power consumption
     @constraint(
         model,
         [t in 1:simulation_length],
-        (h_demand[t] == h_electrolyzer[t] + h_storage_out[t] - h_storage_in[t])
+        p_compressor[t] == compressor.constant * h_storage_in[t]
+    )
+   
+        # Electrolyzer output
+    @constraint(
+        model,
+        [t in 1:simulation_length],
+        (h_electrolyzer[t] == h_demand_dir[t] + h_storage_in[t])
+    )
+
+    # System output
+    @constraint(
+        model,
+        [t in 1:simulation_length],
+        (h_demand[t] == h_demand_dir[t] + h_storage_out[t])
     )
 
         # Hourly flexibility constraint
@@ -750,7 +779,10 @@ function solveoptimizationmodel(
         model, 
         Min, 
         (getinvestmentcosts(model, parameters) +
-        sum(getmarketvalue(model, timeseries, lambda_TSO, t) for t in 1:simulation_length))
+        sum(
+            p_DAM_buy[t] * (timeseries.price_DAM[t] + lambda_TSO) - 
+            p_DAM_sell[t] * timeseries.price_DAM[t] 
+            for t in 1:simulation_length))
     )
 
     # Solving the model
