@@ -606,12 +606,12 @@ function solveoptimizationmodel(
     end
 
     #Optional constraints for fixed capacities
-    @constraints(model, begin
-        c_solar == 50
-        c_wind_on == 0
-        c_wind_off == 0
-        #c_electrolyzer == 12
-    end)
+    # @constraints(model, begin
+    #     c_solar == 40
+    #     c_wind_on == 0
+    #     c_wind_off == 10
+    #     c_electrolyzer == 6.5
+    # end)
 
         # Operation
     @variables(model, begin
@@ -785,7 +785,7 @@ function unconstrainedmodel(
 
     # Limitting max capacities
     if !isa(scenario.maxcapgeneration, Bool)
-        @constraint(model, c_solar + c_wind_on + c_wind_off == scenario.maxcapgeneration)
+        @constraint(model, c_solar + c_wind_on + c_wind_off <= scenario.maxcapgeneration)
     end
 
     # Limiting individual capacities
@@ -1233,7 +1233,7 @@ function optimizeptx(
     if verbose
         println("Parameters: ", parameters)
     end
-    solvedmodel = solveoptimizationmodel(parameters, 900, 0.05)
+    solvedmodel = solveoptimizationmodel(parameters, 600, 0.05)
     println("Opportunity is $(opportunity)")
     if opportunity
         solvedopportunity = unconstrainedmodel(parameters, 60)
