@@ -1,11 +1,10 @@
 {
     "scenarios": {
         "name": "Example_2021",
-        "simulation_days": 84,
         "hourly_target": 100,
-        "etc_length": 336,
-        "htc_length": 336,
-        "flexrange": 1,
+        "etc_periods": 12,
+        "htc_periods": 12,
+        "flexrange": 0,
         "lambda_TSO": 10,
         "discount_rate": 0.05,
         "maxcapgeneration": 100
@@ -60,5 +59,9 @@
             "soc_init": 0.5
         }
     },
-    "timeseriesfile": "ES_Timeseriesdata2020.csv"
+    "timeseriesfiles": {
+        "profiles": "resulting_profiles.csv",
+        "decision": "decision_variables_short.csv",
+        "ordering": "ordering_variable.csv"
+    }
 }
