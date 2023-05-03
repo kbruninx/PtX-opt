@@ -92,7 +92,7 @@ struct Compressor_Data
 end
 
 #Forwards function calls to the component_data field for the Storage_Data structure
-@forward((Storage_Data, :component_data), Component_Data)
+@forward((Compressor_Data, :component_data), Component_Data)
 
 struct Timeseries_Data
     # Timeseries data structure, containing all the timeseries data needed for the optimization model
@@ -371,14 +371,12 @@ function getinvestmentcosts(
     parameters::Parameter_Data
 )
     sum = 0
-    c_compressor = model[:c_electrolyzer]*parameters.components["electrolyzer"].efficiency*parameters.components["compressor"].constant
     capacitycomponentpairs = zip(
-        (model[char] for char in [:c_solar, :c_wind_on, :c_wind_off, :c_electrolyzer, :c_storage]),
-        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
+        (model[char] for char in [:c_solar, :c_wind_on, :c_wind_off, :c_electrolyzer, :c_storage, :c_compressor]),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage", "compressor"))
     )
     for (capacity, component) in capacitycomponentpairs
         sum += getcomponentcosts(capacity, parameters.scenario, component)
-        #sum += getcomponentcosts(c_compressor, parameters.scenario, parameters.components["compressor"])
     end
     return sum
 end
@@ -591,6 +589,7 @@ function solveoptimizationmodel(
         0 <= c_wind_on #Onshore capacity
         0 <= c_wind_off #Offshore capacity
         0 <= c_electrolyzer <= maxcapelectrolyzer(parameters) #Electrolyzer capacity
+        0 <= c_compressor #Offshore capacity
         0 <= c_storage <= maxcapstorage(parameters) #Storage capacity
     end)
 
@@ -742,6 +741,12 @@ function solveoptimizationmodel(
         [t in 1:simulation_length],
         p_compressor[t] == compressor.constant * h_storage_in[t]
     )
+
+    @constraint(
+        model,
+        [t in 1:simulation_length],
+        p_compressor[t] <= c_compressor
+    )
    
         # Electrolyzer output
     @constraint(
@@ -877,8 +882,8 @@ function getresults(
     # Defining the most commonly used parameternames for readability
 
     capacitycomponentpairs = zip(
-        (var_data[:c_solar], var_data[:c_wind_on], var_data[:c_wind_off], var_data[:c_electrolyzer], var_data[:c_storage]),
-        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
+        (var_data[:c_solar], var_data[:c_wind_on], var_data[:c_wind_off], var_data[:c_electrolyzer], var_data[:c_storage], var_data[:c_compressor]),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage", "compressor"))
     )
 
     # Preparing the data for plotting
