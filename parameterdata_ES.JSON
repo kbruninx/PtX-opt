@@ -1,7 +1,7 @@
 {
     "scenarios": {
         "name": "Example_2021",
-        "simulation_days": 84,
+        "simulation_days": 168,
         "hourly_target": 100,
         "etc_length": 1,
         "htc_length": 336,
