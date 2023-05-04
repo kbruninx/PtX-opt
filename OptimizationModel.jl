@@ -36,8 +36,8 @@ struct Scenario_Data
     lambda_TSO::Float64 # TSO penalty factor
     # Hydrogen target
     hourly_target::Float64 # kg/h of hydrogen production
-    etc_periods::Int64 #number of hours per electricity temporal correlation period
-    htc_periods::Int64 #number of hours per hyrdogen temporal correlation period
+    no_etc_periods::Int64 #number of hours per electricity temporal correlation period
+    no_htc_periods::Int64 #number of hours per hyrdogen temporal correlation period
     flexrange::Float64 #flexibility range in % of the hourly target
     # Cap on combined generation capacity
     maxcapgeneration::Number
@@ -88,7 +88,7 @@ struct Compressor_Data
 end
 
 #Forwards function calls to the component_data field for the Storage_Data structure
-@forward((Storage_Data, :component_data), Component_Data)
+@forward((Compressor_Data, :component_data), Component_Data)
 
 struct Timeseries_Data
     # Timeseries data structure, containing all the timeseries data needed for the optimization model
@@ -113,8 +113,8 @@ Base.show(io::IO, s::Scenario_Data) = print(io, "Scenario Data:
     Discount rate = $(s.discount_rate),
     TSO tariff = $(s.lambda_TSO),
     Hourly production target = $(s.hourly_target),
-    Electrical Temporal Correlation length = $(s.etc_periods),
-    Hydrogen Temporal Correlation length = $(s.htc_periods),
+    Electrical Temporal Correlation length = $(s.no_etc_periods),
+    Hydrogen Temporal Correlation length = $(s.no_htc_periods),
     Flexibility range = $(s.flexrange),
     Max combined generation capacity = $(s.maxcapgeneration)"
 )
@@ -285,8 +285,8 @@ function scenariofromdict(dict)
         dict["discount_rate"],
         dict["lambda_TSO"],
         dict["hourly_target"],
-        dict["etc_periods"],
-        dict["htc_periods"],
+        dict["no_etc_periods"],
+        dict["no_htc_periods"],
         dict["flexrange"],
         dict["maxcapgeneration"]
     )
@@ -486,7 +486,10 @@ function getmarketvalue(
     lambda_TSO::Float64,
     t::Int64
 )
-    return model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) - model[:p_DAM_sell][t] * timeseries.price_DAM[t]
+    return (
+        model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) -
+         model[:p_DAM_sell][t] * timeseries.price_DAM[t]
+    )
 end
 
 function compressorconstant(
@@ -505,14 +508,14 @@ function rep_to_ext(
     repvals,
     ordering::Array{Float64, 2};
     daily::Bool = false
+    
 )
     if daily == true
-        repvals = [sum(repvals[i:i+23]) for i in 1:24:length(repvals)]
-        return ordering*repvals
+        reparray = [sum(repvals[i:i+23]) for i in 1:24:length(repvals)]
     else 
         reparray = reshape(repvals, 24, length(repvals)÷24)'
-        return ordering*reparray
     end
+    return vec((ordering*reparray)')
 end
 
 function hourlyperiodsarray(
@@ -577,8 +580,8 @@ function solveoptimizationmodel(
     # Defining the most commonly used parameternames for readability
     scenario = parameters.scenario
     hourly_target = scenario.hourly_target
-    etc_periods = scenario.etc_periods
-    htc_periods = scenario.htc_periods
+    no_etc_periods = scenario.no_etc_periods
+    no_htc_periods = scenario.no_htc_periods
     flexrange = scenario.flexrange
     lambda_TSO = scenario.lambda_TSO
 
@@ -593,10 +596,13 @@ function solveoptimizationmodel(
     total_days = size(timeseries.ordering, 1)
     total_timesteps = total_days*24
 
-    htc_array = hourlyperiodsarray(htc_periods, daysintotal=total_days)
-    etc_array = hourlyperiodsarray(etc_periods, daysintotal=total_days)
+    println("Putting together the arrays with the periods: $no_htc_periods and $total_days")
+    htc_periods = hourlyperiodsarray(no_htc_periods, daysintotal=total_days)
+    println("HTC array shape: ", size(htc_periods))
+    etc_periods = hourlyperiodsarray(no_etc_periods, daysintotal=total_days)
+    println("ETC array shape: ", size(etc_periods))
 
-    hourlymatching = (etc_periods==1)
+    hourlymatching = false #(no_etc_periods==8760)
     println("Hourly matching: ", hourlymatching)
 
     # Defining the variables
@@ -652,15 +658,22 @@ function solveoptimizationmodel(
         )
     end
 
+    netconsumption_rep = [
+        p_DAM_buy[t] - (
+            p_DAM_sell[t] +
+            os_electrolyzer[t]*p_electrolyzer[t]*electrolyzer.efficiency*compressor.constant +
+            (1 - os_electrolyzer[t]) * (electrolyzer.P_standby * c_electrolyzer))
+        for t in 1:representative_timesteps
+    ]
+
+    netconsumption_ext = rep_to_ext(netconsumption_rep, timeseries.ordering)
+
         #Temporal correlation constraint
     @constraint(
         model, 
         [period in etc_periods], 
         (sum(
-            (p_DAM_buy[t] - (
-                p_DAM_sell[t] +
-                os_electrolyzer[t]*p_electrolyzer[t]*electrolyzer.efficiency*compressor.constant +
-                (1 - os_electrolyzer[t]) * (electrolyzer.P_standby * c_electrolyzer))) 
+             netconsumption_ext[t]
         for t in period) <= 0)
     )
     
@@ -725,6 +738,12 @@ function solveoptimizationmodel(
             os_electrolyzer[t]))
     )
 
+    h_storage_soc_ext = rep_to_ext([h_storage_soc[t] for t in 1:representative_timesteps], timeseries.ordering)
+    h_storage_in_ext = rep_to_ext([h_storage_in[t] for t in 1:representative_timesteps], timeseries.ordering)
+    h_storage_out_ext = rep_to_ext([h_storage_out[t] for t in 1:representative_timesteps], timeseries.ordering)
+
+    println("SIZE OF HSTORAGEOUT is:", size(h_storage_out_ext))
+
         # Hydrogen storage capacity
     @constraint(
         model,
@@ -735,20 +754,20 @@ function solveoptimizationmodel(
         # Hydrogen storage initialization
     @constraint(
         model,
-        (h_storage_soc[1] == storage.soc_init*c_storage + h_storage_in[1] - h_storage_out[1])
+        (h_storage_soc_ext[1] == storage.soc_init*c_storage + h_storage_in_ext[1] - h_storage_out_ext[1])
     )
     
         # Electrolyzer hydrogen storage state of charge
     @constraint(
         model,
-        [t in 2:representative_timesteps],
-        (h_storage_soc[t] == h_storage_soc[t-1] + h_storage_in[t] - h_storage_out[t])
+        [t in 2:total_timesteps],
+        (h_storage_soc_ext[t] == h_storage_soc_ext[t-1] + h_storage_in_ext[t] - h_storage_out_ext[t])
     )
 
         # Hydrogen storage final state of charge equal to initial state of charge
     @constraint(
         model,
-        h_storage_soc[1] == h_storage_soc[representative_timesteps]
+        h_storage_soc_ext[1] == h_storage_soc_ext[total_timesteps]
     )
 
     # Compressor power consumption
@@ -787,26 +806,29 @@ function solveoptimizationmodel(
         (1+(flexrange/(2-flexrange)))*hourly_target 
     )
 
-    rep_demand = [h_demand[t] for t in 1:representative_timesteps]
-    tot_demand = rep_to_ext(rep_demand, timeseries.ordering)
+    h_demand_rep = [h_demand[t] for t in 1:representative_timesteps]
+    h_demand_ext = rep_to_ext(h_demand_rep, timeseries.ordering)
 
         # Hydrogen temporal correlation constraint
     @constraint(
         model, 
         [period in htc_periods], 
-        (sum(h_demand[t] for t in period) == 
-        htc_periods*hourly_target)
+        (sum(h_demand_ext[t] for t in period) == 
+        length(period)*hourly_target)
     )
 
     # Defining the objective function
     @objective(
         model, 
         Min, 
-        (getinvestmentcosts(model, parameters) +
-        sum(decision_array[t] * (
-            p_DAM_buy[t] * (timeseries.price_DAM[t] + lambda_TSO) - 
-            p_DAM_sell[t] * timeseries.price_DAM[t])
-            for t in 1:representative_timesteps))
+        (
+            getinvestmentcosts(model, parameters) +
+            sum(
+                decision_array[t] * (
+                p_DAM_buy[t] * (timeseries.price_DAM[t] + lambda_TSO) - 
+                p_DAM_sell[t] * timeseries.price_DAM[t])
+                for t in 1:representative_timesteps)
+        )
     )
 
     # Solving the model
@@ -903,8 +925,8 @@ function getresults(
     total_timesteps = size(parameters.timeseries.ordering, 1)*24
 
     capacitycomponentpairs = zip(
-        (var_data[:c_solar], var_data[:c_wind_on], var_data[:c_wind_off], var_data[:c_electrolyzer], var_data[:c_storage]),
-        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage"))
+        (var_data[char] for char in (:c_solar, :c_wind_on, :c_wind_off, :c_electrolyzer, :c_storage, :c_compressor)),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off", "electrolyzer", "storage", "compressor"))
     )
 
     # Preparing the data for plotting
@@ -938,18 +960,28 @@ function getresults(
         :h_storage_soc => var_data[:h_storage_soc]
     )
 
+    total_cost = objective_value(model)-opportunity_cost
+    total_profit_DAM = sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))
+    capital_cost = objective_value(model)-total_profit_DAM
+
     # Extracting outcomes
     outcome_data = Dict{String, Union{Float64, Dict{String, Float64}}}(
-        "Total costs" => objective_value(model)-opportunity_cost,
+        "Total costs" => total_cost,
         "Average cost of Hydrogen" => (objective_value(model)-opportunity_cost)/(parameters.scenario.hourly_target*total_timesteps),
-        "Electrolyzer capacity factor" => mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer])
+        "Unadjusted average cost of Hydrogen" => objective_value(model)/(parameters.scenario.hourly_target*total_timesteps),
+        "Electrolyzer capacity factor" => mean(var_data[:p_electrolyzer]./var_data[:c_electrolyzer]),
+        "Total profit power market" => total_profit_DAM 
     )
 
     for (capacity, component) in capacitycomponentpairs
-        outcome_data["$(name(component))"] = Dict("capacity"=> capacity, "cost" => getcomponentcosts(capacity, parameters.scenario, component))
+        componentcost = getcomponentcosts(capacity, parameters.scenario, component)
+        outcome_data["$(name(component))"] = Dict(
+            "capacity"=> capacity, 
+            "cost" => componentcost, 
+            "percentage" => componentcost/capital_cost
+        )
     end
 
-    outcome_data["Total profit power market"] = sum(p_DAM.*(p_DAM_sell.-p_DAM_buy))
 
     # Printing the results if verbose
     if verbose
@@ -967,7 +999,7 @@ function savedata(
     data::Dict{Any,Any},
     parameters::Parameter_Data
 )
-    filename = "results_$(parameters.scenario.etc_periods)_$(Parameters.scenario.htc_periods)_$(parameters.scenario.flexrange).csv"
+    filename = "results_$(parameters.scenario.no_etc_periods)_$(Parameters.scenario.no_htc_periods)_$(parameters.scenario.flexrange).csv"
     # Saving the results to a csv file
     combined_data = hcat(data[:power_data], data[:hydrogen_data])
     CSV.write(filename, combined_data)
@@ -1065,7 +1097,7 @@ function hydrogenfig(
 end
 
 function plotdata(
-    data::Dict{Symbol,DataFrame};
+    data::Dict{Symbol,Any};
     parameters=false
 )
     powerdata = data[:power_data]
@@ -1101,9 +1133,9 @@ end
 function make3dplot(
     results::DataFrame
 )
-    X = convert(Array{Float32,1}, results[:, :etc_periods])
+    X = convert(Array{Float32,1}, results[:, :no_etc_periods])
     Y = convert(Array{Float32,1}, 100*results[:, :flexrange])
-    Z = convert(Array{Float32,1}, results[:, :htc_periods])
+    Z = convert(Array{Float32,1}, results[:, :no_htc_periods])
 
     C = [convert(Float32, x) for x in (results[:, :LCOH])]
 
@@ -1141,9 +1173,9 @@ function plotheatmap(
     normalized::Bool=false,
     percentage::Bool=false
 )
-    X=:etc_periods
+    X=:no_etc_periods
     Y2=:flexrange
-    Y1=:htc_periods
+    Y1=:no_htc_periods
 
     # Sorting results
     sort!(results, [X, Y1, Y2])
