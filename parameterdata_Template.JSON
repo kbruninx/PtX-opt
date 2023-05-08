@@ -2,12 +2,12 @@
     "scenarios": {
         "name": "Example_2021",
         "hourly_target": 100,
-        "no_etc_periods": 8760,
-        "no_htc_periods": 52,
-        "flexrange": 0.2,
+        "no_etc_periods": [1,12,365,8760],
+        "no_htc_periods": [1,12,365,8760],
+        "flexrange": [0, 0.33, 0.66, 1],
         "lambda_TSO": 10,
         "discount_rate": 0.05,
-        "maxcapgeneration": 50
+        "maxcapgeneration": 100
     },
     "sensitivity_analysis": {
         "variables": false,
@@ -33,7 +33,7 @@
             "maxcapacity": false
         },
         "electrolyzer": {
-            "systemprice": 1400000,
+            "systemprice": 740000,
             "fixopex": 0.02,
             "lifetime": 20,
             "maxcapacity": false,
