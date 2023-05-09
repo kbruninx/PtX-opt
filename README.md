@@ -8,20 +8,21 @@ List of files:
 
 * OptimizationModel.jl
 
-The main module which runs the optimization given a number of parameters. The function main() takes as a main input the parameterdata.JSON file, 
-which contains all the parameters needed to run the optimization. It returns the results, which it also saves to csv files and figures, given that 
-the function is run with the savefigs and savecsv arguments as true. These files are saved in the Results folder.
+The main module which runs the optimization given a number of parameters. The function mainscript() takes as a main input a .JSON filepath, in the format of the parameterdata_Template.JSON file, which contains all the parameters needed to run the optimization. 
+It returns the results, with hourly data on hydrogen flows and power flows, and an outcome dictionary, with design and cost outcomes. This is either returned as a single dictionary, or in the case of a scenario analysis in the form of a dataframe. 
+It is currently recommended to calculate any desired results and save them to a variable, which can then be fed to functions such as makeplots() or makeheatmap() to generate visual representations. 
 
-* parameterdata.JSON
+* parameterdata_Template.JSON
 
 Contains all the parameter information. Parameter data can be divided in three categories: scenario data, component data, and timeseries data. 
 For data references, see the Maths.TeX file.
+To run a number of different scenario's, the inputs for the scenario data can be given in the form of arrays (e.g., no_etc_periods=[12,365,8760]). In this case, each permutation of each of the input values is calculated.
 
-* Timeseriesdata 2021.csv
+* ES90_–.csv
 
-Example data drawn from the ENTSOE transparency platform. All data is for the bidding zone NL. The capacity factors are calculated by normalizing the 
-actual generation using the maximum value for the year. This should eventually be adjusted, considering this does not adequately account for new generation
-being installed throughout the year, causing the values earlier in the year to be underestimated.
+Example data drawn from the ENTSOE transparency platform for 01.2020-01.2023. All data is for the bidding zone ES. The capacity factors are calculated by normalizing the 
+actual generation using the maximum value for the year. This could eventually be adjusted, considering this does not adequately account for new generation being installed throughout the year, causing the values earlier in the year to be underestimated.
+The data has been transformed to a set of representative days with decision weightings and orderings representing each non-represented day as a linear-representation of represented days.
 
 * csvtools.jl
 

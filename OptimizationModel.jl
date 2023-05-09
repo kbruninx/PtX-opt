@@ -393,104 +393,6 @@ function maxcapstorage(
     )
 end
 
-
-function getelectrolyzerproduction(
-    p_electrolyzer,
-    os_electrolyzer,
-    electrolyzer::Electrolyzer_Data
-)
-    return (
-        electrolyzer.efficiency * 
-        p_electrolyzer * 
-        os_electrolyzer
-    )
-end
-
-#The net power consumption from the grid, which excludes standby and compressor consumption
-function getnetpower(
-    model::JuMP.Model,
-    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data, Compressor_Data}},
-    t::Int64
-)
-    electrolyzer = components["electrolyzer"]
-    compressor = components["compressor"]
-    return (
-        model[:p_DAM_buy][t] -
-        (
-            model[:p_DAM_sell][t] +
-            model[:os_electrolyzer][t]*model[:p_electrolyzer][t]*electrolyzer.efficiency*compressor.constant+
-            ((1 - model[:os_electrolyzer][t]) *
-                (electrolyzer.P_standby * model[:c_electrolyzer]))
-        )
-    )
-end
-
-function upperbound_electrolyzer(
-    model::JuMP.Model, 
-    electrolyzer::Electrolyzer_Data, 
-    t::Int64
-)
-    return(
-        model[:c_electrolyzer]*model[:os_electrolyzer][t] +
-        electrolyzer.P_standby*model[:c_electrolyzer]*(1-model[:os_electrolyzer][t])
-    )
-end
-
-function lowerbound_electrolyzer(
-    model::JuMP.Model, 
-    electrolyzer::Electrolyzer_Data, 
-    t::Int64
-)
-    return(
-        electrolyzer.P_min*model[:c_electrolyzer]*model[:os_electrolyzer][t] + 
-        electrolyzer.P_standby*model[:c_electrolyzer]*(1-model[:os_electrolyzer][t])
-    )
-end
-
-function energygenerated(
-    model::JuMP.Model,
-    timeseries::Timeseries_Data,
-    t::Int64
-)
-    generation = (
-        model[:c_solar]*timeseries.solar[t] +
-        model[:c_wind_on]*timeseries.wind_on[t] +
-        model[:c_wind_off]*timeseries.wind_off[t]
-    )
-    return generation
-end
-
-function energyconsumed(
-    model::JuMP.Model,
-    components::Dict{String, Union{Component_Data, Electrolyzer_Data, Storage_Data, Compressor_Data}},
-    t::Int64
-)
-    electrolyzer = components["electrolyzer"]
-    compressor = components["compressor"]
-    p_elec = model[:p_electrolyzer][t]
-    os_elec = model[:os_electrolyzer][t]
-    return (
-        p_elec+
-        (getelectrolyzerproduction(
-            p_elec, 
-            os_elec, 
-            electrolyzer)*
-        compressor.constant)
-    )
-end
-
-function getmarketvalue(
-    model::JuMP.Model,
-    timeseries::Timeseries_Data,
-    lambda_TSO::Float64,
-    t::Int64
-)
-    return (
-        model[:p_DAM_buy][t] * (timeseries.price_DAM[t] + lambda_TSO) -
-         model[:p_DAM_sell][t] * timeseries.price_DAM[t]
-    )
-end
-
 function compressorconstant(
     cd::Dict #Compressor dictionary
 )
@@ -503,54 +405,56 @@ function compressorconstant(
     return K
 end
 
+# Transforms an array of representative values to an array of hourly values over the year based on an ordering matrix
 function rep_to_ext(
     repvals,
     ordering::Array{Float64, 2};
     daily::Bool = false
     
 )
+    #When the resolution of the sums is daily, we can speed up the calculation by first summing the representative values per day
     if daily == true
         reparray = [sum(repvals[i:i+23]) for i in 1:24:length(repvals)]
+    #Otherwise we are going to reshape the representative values to a matrix of 24 columns and as many rows as there are representative days
     else 
         reparray = reshape(repvals, 24, length(repvals)÷24)'
     end
+    #We then perform a matrix multiplication which will yield a matrix with 24 columns and as many rows as there are total days, which we flatten to a vector
     return vec((ordering*reparray)')
 end
 
+# Generates a vector of vectors each representing a period out of a number of periods over a number of total days
+# In the case of larger than daily periodes, we have to ensure the periods are sliced per day rather than per hour
 function hourlyperiodsarray(
     periods::Int64;
     daysintotal::Int64=365
 )
-    if periods > daysintotal
+    # Checks if we're slicing days or hours
+    if periods >= daysintotal
+        # Checks if we can slice days evenly
         if (daysintotal*24)%periods != 0
             throw(ArgumentError("Can not slice days unevenly for $periods periods: $((daysintotal*24)%periods)"))
         end
+        # Finds the indices of the start of each of the periods for an hourly resolution
         hourlyidx = [round(Int64, i) for i in range(0,daysintotal*24,periods+1)]
+        # Fills out the idx array, mapping each start index to an array of hours for that entire period
         hourlyarray = [collect(hourlyidx[i-1]+1:hourlyidx[i]) for i in 2:length(hourlyidx)]
         return hourlyarray
     else
+        # Finds the indices of the start of each of the periods for a daily resolution
         dailyidx = [round(Int64, i) for i in range(0,daysintotal,periods+1)]
+        # Fills out the idx array, mapping each start index to an array of days for that entire period
         dailyarray = [collect(dailyidx[i-1]:dailyidx[i]-1) for i in 2:length(dailyidx)]
+        # Maps each day to an array of hours for that day
         return [vcat([collect(24*day+1:24*day+24) for day in days]...) for days in dailyarray]
     end
 end
 
 """
-    
-
-    This function takes the model and returns a dictionary with the results
-    The keys are the names of the variables and the values are the values of the variables
-"""
-function getresultsdict(m::JuMP.Model)
-    return Dict(
-        k => value.(v) for 
-        (k, v) in object_dictionary(m)
-    )
-end
-
-"""
     solveoptimizationmodel(
-        parameters::Parameter_Data
+        parameters::Parameter_Data,
+        time_limit::Int64,
+        mip_gap::Float64
     )
 
 This function takes parameter data and returns a solved model with the results for the given parameters.
@@ -558,6 +462,8 @@ This function takes parameter data and returns a solved model with the results f
 # Arguments
 
 - `parameters::Parameter_Data`: Structure containing all the parameters for the optimization model
+- `time_limit::Int64`: Time limit in seconds for the optimization model
+- `mip_gap::Float64`: MIP gap for the optimization model
     
 # Returns
 
@@ -609,7 +515,7 @@ function solveoptimizationmodel(
         0 <= c_wind_on #Onshore capacity
         0 <= c_wind_off #Offshore capacity
         0 <= c_electrolyzer #<= maxcapelectrolyzer(parameters) #Electrolyzer capacity
-        0 <= c_compressor #Offshore capacity
+        0 <= c_compressor #Compressor capacity
         0 <= c_storage #<= maxcapstorage(parameters) #Storage capacity
     end)
 
@@ -878,6 +784,13 @@ function unconstrainedmodel(
 
 end
 
+function getresultsdict(m::JuMP.Model)
+    return Dict(
+        k => value.(v) for 
+        (k, v) in object_dictionary(m)
+    )
+end
+
 """
     getresults(
         model::JuMP.Model, 
@@ -903,7 +816,7 @@ function getresults(
     opportunity_cost::Union{Float64, Int} = 0
 )
     if termination_status(model) == MOI.INFEASIBLE
-        return "Unfeasible"
+        return "Infeasible"
     elseif termination_status(model) == MOI.TIME_LIMIT
         return "Time limit reached"
     elseif termination_status(model) != MOI.OPTIMAL
@@ -913,7 +826,6 @@ function getresults(
     # Defining the most commonly used parameternames for readability
     var_data = getresultsdict(model)
     total_timesteps = size(parameters.timeseries.ordering, 1)*24
-
     decision_array = repeat(parameters.timeseries.decision, inner=24)
     ordering = parameters.timeseries.ordering
 
@@ -961,7 +873,7 @@ function getresults(
     outcome_data = Dict{String, Union{Float64, Dict{String, Float64}}}(
         "Total costs" => total_cost,
         "Unadjusted costs" => objective_value(model),
-        "Average cost of Hydrogen" => (objective_value(model)-opportunity_cost)/(parameters.scenario.hourly_target*total_timesteps),
+        "Average cost of Hydrogen" => (ototal_cost)/(parameters.scenario.hourly_target*total_timesteps),
         "Unadjusted average cost of Hydrogen" => objective_value(model)/(parameters.scenario.hourly_target*total_timesteps),
         "Electrolyzer capacity factor" => mean((var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), weights(decision_array)),
         "Total profit power market" => total_profit_DAM 
@@ -1009,21 +921,17 @@ function addoutcometodf(
         for result in results[:, "Results"]
             if result isa Dict{Symbol, Any}
                 push!(data, result[:outcome_data][outcome])
-            elseif isnan(result)
+            elseif  !(result isa Number) || isnan(result) 
                 push!(data, NaN)
             end
         end
-        for datapoint in data
-            if datapoint isa Dict{String, Any}
-                for key in keys(datapoint)
-                    insertcols!(results, "$(outcome)_$(key)" => [datapoint[key] for datapoint in data])
-                end
-            elseif isnan(datapoint)
-                insertcols!(results, "$(outcome)" => data)
-            elseif datapoint isa Float64
-                insertcols!(results, "$(outcome)" => data)
+        dictdata = filter(t -> (typeof(t)==Dict{String, Float64}), data)
+        if !isempty(dictdata)
+            for key in keys(dictdata[1])
+                insertcols!(results, "$(outcome)_$(key)" => [if typeof(datapoint)==Dict{String, Float64} datapoint[key] else datapoint end for datapoint in data])
             end
-
+        else
+            insertcols!(results, "$(outcome)" => data)
         end
     end
     return results
@@ -1119,12 +1027,12 @@ function plotdata(
         damprices = zeros(length(powerdata[:, :p_solar]))
     end
 
-    # Collecting all the power data
+    # Collecting all the hydrogen data
     hydrogenlabels = ["Electrolyzer", "Storage in", "Storage out", "Demand"]
     hydrogenflow = [hydrogendata[:, datapoint] for datapoint in [:h_electrolyzer, :h_storage_in, :h_storage_out, :h_demand]]
     hsoc = hydrogendata[:, :h_storage_soc]
 
-    # Plotting the power flows over the entire period
+    # Plotting the flows
     println("Working on full plot")
     pfig = powerfig(powerflow, powerlabels)
     println("Working on subset plot")
@@ -1160,6 +1068,7 @@ function make3dplot(
     fig
 end
 
+#Unfinished function
 function plotsensitivity(
     results::DataFrame;
     normalized::Bool=true,
@@ -1172,10 +1081,24 @@ function plotsensitivity(
 
 end
 
+"""
+    plotheatmap(
+        results::DataFrame;
+        C::Union{Symbol,String}=:LCOH,
+        Clabel::String="LCOH [€/kg]",
+        normalized::Bool=false,
+        percentage::Bool=false
+    )
 
+Plots a heatmap of the results of a scenario analysis. 
+The heatmap is plotted using the `C` column of the `results` DataFrame. 
+The `Clabel` is the label of the colorbar. 
+The `normalized` argument determines whether the heatmap is normalized. 
+The `percentage` argument determines whether the heatmap is plotted in percentages.
+"""
 function plotheatmap(
     results::DataFrame;
-    C::Symbol=:LCOH,
+    C::Union{Symbol,String}=:LCOH,
     Clabel::String="LCOH [€/kg]",
     normalized::Bool=false,
     percentage::Bool=false
@@ -1187,27 +1110,30 @@ function plotheatmap(
     # Sorting results
     sort!(results, [X, Y1, Y2])
 
+    # Dictionary to map numbers to labels
     timedict = Dict(
-        1 => "Hourly",
-        24 => "Daily",
-        168 => "Weekly",
-        336 => "Biweekly",
-        672 => "Monthly",
-        2016 => "Quarterly",
-        4032 => "Half-yearly",
-        8064 => "Yearly"
+        1 => "Yearly",
+        4 => "Quarterly",
+        12 => "Monthly",
+        26 => "Biweekly",
+        52 => "Weekly",
+        365 => "Daily",
+        8760 => "Hourly"
     )
 
+    # Creating the labels
     Xlabels = [timedict[label] for label in unique(results[:, X])]
     Y2labels = ["$(100*label)%" for label in unique(results[:, Y2])]
     Y1labels = [timedict[label] for label in unique(results[:, Y1])]
     Xscenarios = length(Xlabels)
     Yscenarios = length(Y1labels)*length(Y2labels)
 
+    # Creating the value arrays
     Xvals = repeat(range(1, Xscenarios), inner=convert(Int64,Yscenarios))
     Yvals = repeat(range(1, Yscenarios), convert(Int64,Xscenarios))
-
     Cvals = [convert(Float32, x) for x in (results[:, C])]
+
+    # Normalizing the values if required
     if percentage
         Cvals = [Cvals[i]/results[:total_cost]]
     end
@@ -1221,7 +1147,7 @@ function plotheatmap(
         fig[1, 1], 
         xlabel="ETC length", 
         ylabel="HTC length", 
-        title="Average cost of hydrogen production for various scenarios without optimization [€/kg]",
+        title="Average cost of hydrogen production for various scenarios with optimization [€/kg]",
         xticks=(range(1, Xscenarios),Xlabels),
         yticks=(
             range(
@@ -1272,7 +1198,7 @@ function plotheatmap(
     hidexdecorations!(ax2)
     
     Colorbar(fig[:,2], hm, label=Clabel)
-fig
+    fig
 end
 
 function saveresults(
@@ -1343,7 +1269,7 @@ function optimizeptx(
             verbose=verbose, 
             opportunity_cost=opportunity_cost)
     else
-        throw(ErrorException("Optimal solution not found."))
+        throw(ErrorException("Optimal solution not found. \n Termination status: $(termination_status(solvedmodel))"))
     end
     return results
 end
@@ -1397,7 +1323,7 @@ function mainscript(
     parameterfilename::String,
     verbose::Bool=true;
     savepath::String="$(home_dir)/Results",
-    savecsv::Bool=true,
+    savecsv::Bool=false,
     opportunity::Bool=true
 )   
     parameters = fetchparameterdata(parameterfilename)
