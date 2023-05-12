@@ -2,12 +2,12 @@
     "scenarios": {
         "name": "Example_2021",
         "hourly_target": 100,
-        "no_etc_periods": 12,
+        "no_etc_periods": [8760],
         "no_htc_periods": 365,
-        "flexrange": 0.8,
+        "flexrange": 0.2,
         "lambda_TSO": 10,
         "discount_rate": 0.05,
-        "maxcapgeneration": 50
+        "maxcapgeneration": 55
     },
     "sensitivity_analysis": {
         "variables": false,
