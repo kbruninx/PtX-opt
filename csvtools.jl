@@ -4,15 +4,17 @@ using Statistics
 using Dates
 using Missings
 
+folderpath = joinpath(@__DIR__, "Rawdata/")
+
 DAfiles = [
-    "Day-ahead Prices_202001010000-202101010000.csv", 
-    "Day-ahead Prices_202101010000-202201010000.csv",
-    "Day-ahead Prices_202201010000-202301010000.csv"
+    "NL_Day-ahead Prices_202001010000-202101010000.csv", 
+    "NL_Day-ahead Prices_202101010000-202201010000.csv",
+    "NL_Day-ahead Prices_202201010000-202301010000.csv"
 ]
 AGfiles = [
-    "Actual Generation per Production Type_202001010000-202101010000.csv", 
-    "Actual Generation per Production Type_202101010000-202201010000.csv",
-    "Actual Generation per Production Type_202201010000-202301010000.csv"
+    "NL_Actual Generation per Production Type_202001010000-202101010000.csv", 
+    "NL_Actual Generation per Production Type_202101010000-202201010000.csv",
+    "NL_Actual Generation per Production Type_202201010000-202301010000.csv"
     ]
 
 columnnamedict = Dict(
@@ -91,7 +93,7 @@ function dataframefromcsvs(
 )
     dfs = [
         CSV.File(
-            csvfilename,
+            joinpath(folderpath, csvfilename),
             select=[timecolumn, datacolumns...],
             missingstring=["N/A", "", " "],
             typemap=Dict(Int=>Float64)
@@ -163,8 +165,8 @@ end
 
 function createtimeseriescsv(
     dayaheadfilenames::Array{String,1},
-    generationfilenames::Array{String,1},
-    outfilename::String
+    generationfilenames::Array{String,1};
+    outfilename::String=""
 )
     dadf = dataframefromcsvs(
         dayaheadfilenames, 
