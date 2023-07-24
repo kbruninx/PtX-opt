@@ -1,0 +1,68 @@
+{
+    "scenarios": {
+        "name": "Example_2021",
+        "hourly_target": 100,
+        "no_etc_periods": [1, 12, 52, 365, 8760],
+        "no_htc_periods": [1, 12, 52, 365, 8760],
+        "MPLDSP": [0.0, 0.25, 0.5, 0.75, 0.9],
+        "EI_limit": null,
+        "CFDSP": 0.9,
+        "lambda_TSO": 10,
+        "discount_rate": 0.05,
+        "maxcapgeneration": 25
+    },
+    "sensitivity_analysis": {
+        "variables": false,
+        "adjustments":false
+    },
+    "components": {
+        "solar": {
+            "systemprice": 628000,
+            "fixopex": 0.02,
+            "lifetime": 30,
+            "maxcapacity": false
+        },
+        "wind_on": {
+            "systemprice": 1325000,
+            "fixopex": 0.02,
+            "lifetime": 20,
+            "maxcapacity": false
+        },
+        "wind_off": {
+            "systemprice": 2840000,
+            "fixopex": 0.025,
+            "lifetime": 20,
+            "maxcapacity": 0
+        },
+        "electrolyzer": {
+            "systemprice": 740000,
+            "fixopex": 0.07,
+            "lifetime": 20,
+            "maxcapacity": false,
+            "efficiency": 18.5,
+            "P_min": 0.1,
+            "P_standby": 0.01},
+        "compressor": {
+            "systemprice": 1200000,
+            "fixopex": 0.02,
+            "lifetime": 15,
+            "maxcapacity": false,
+            "inlet_temperature": 313,
+            "inlet_pressure": 30,
+            "outlet_pressure": 200,
+            "efficiency": 0.75
+        },
+        "storage": {
+            "systemprice": 500,
+            "fixopex": 0.02,
+            "lifetime": 30,
+            "maxcapacity": false,
+            "efficiency": 0.95,
+            "soc_init": 0.5
+        }
+    },
+    "timeseriesfiles": {
+        "profiles": "ES60_resulting_profiles.csv",
+        "ordering": "ES60_ordering_variable.csv"
+    }
+}

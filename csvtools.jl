@@ -196,30 +196,6 @@ function isquarterhour(df, timecol)
     deltat = (talead .- tatrail)
     quarterly = deltat .== Dates.Minute(15)
 
-    # # Dealing with summer/wintertime transitions
-    # forwardskip = findall((deltat .== Dates.Minute(120)) .|| (deltat .==  Dates.Minute(75)))
-    # backwardskip = findall((deltat .==  -Dates.Minute(45)) .|| (deltat .==  Dates.Minute(0)))
-    # if length(forwardskip) > 1 || length(backwardskip) > 1
-    #     throw("Unexplained time differences: $(df[:, timecol][forwardskip]) and $(df[:, timecol][backwardskip])")
-    # elseif (length(forwardskip) == length(backwardskip) == 1) || (length(forwardskip) == length(backwardskip) == 0)
-    #     println("Found transition at $(df[:, timecol][forwardskip]) and $(df[:, timecol][backwardskip]), no changes")
-    # elseif length(forwardskip) == 1 && length(backwardskip) == 0
-    #     println("Found transition at $(df[:, timecol][forwardskip]), deleting")
-    #     if quarterly[forwardskip]
-    #         datetimes = df[collect((forwardskip-3):forwardskip), timecol]
-    #         throw(datetimes)
-    #         insert!(df.columns, collect(collect((forwardskip-3):forwardskip), timecol))
-    #     else
-    #         deleteat!(df , idx)
-    #     end
-    # elseif length(forwardskip) == 0 && length(backwardskip) == 1
-    #     println("Found transition at $(df[:, timecol][backwardskip]), deleting")
-    #     if quarterly[backwardskip]
-    #         deleteat!(df , collect(idx:(idx+3)))
-    #     else
-    #         deleteat!(df , idx)
-    #     end
-    # end
     return findfirst(quarterly)
 end
 
@@ -263,6 +239,7 @@ function createEFcsv(
     EFdf = getEFdf(gendf, region)
     return EFdf
 end
+
 
 function createtimeseriesdf(
     dayaheadfilenames::Array{String,1},
@@ -332,3 +309,75 @@ function findprob()
     println(probarray)
     println(sumvalue)
 end
+
+function renormalizeprofiles(
+    filename::String
+)
+    df = CSV.read(filename, DataFrame)
+    
+    cols = ["WindOffshore", "WindOnshore", "Solar"]
+
+    for col in cols
+        max = maximum(df[:, col])
+        df[:, col] = clamp.((df[:, col] ./ (0.9*max)), 0.0, 1.0)
+    end
+
+    describe(df)
+    CSV.write(filename, df)
+
+end
+
+# Some methods for adding the EI ex-post
+
+
+function addemissionstoresults(
+    scenarios,
+    EI,
+    decision_array
+)
+    total_emissions =[]
+    for row in eachrow(scenarios)
+        repdata = row[:Results][:timeseries_data][:repdata]
+        row[:Results][:timeseries_data][:repdata][:, :decision_array] = decision_array
+        attremissions = repdata[:, :p_DAM_buy] .* EI
+        row.Results[:timeseries_data][:repdata][:, :emissions] = attremissions
+        push!(total_emissions, sum(attremissions.*repdata[:, :decision_array]))
+    end
+    scenarios[:, :total_emissions] = total_emissions
+    scenarios[:, :average_emissions] = total_emissions ./ (100*8760)
+    return scenarios
+end
+
+function addemissionstoresultingprofiles(
+    resultingprofiles,
+    emissions
+)
+    # First we create a datetime column in the resulting profiles dataframe with the period (day) and time_step (hour)
+    resultingprofiles[:, "Time"] = [
+        DateTime(2020,1,1,resultingprofiles[i, "time_step"]) + Dates.Day(resultingprofiles[i, "period"]-1)    
+        for i in 1:length(resultingprofiles[:, "period"])]
+    
+    display(resultingprofiles)
+
+    # Then we join the emissions dataframe to the resulting profiles dataframe on the datetime column
+    resultingprofilesEM = innerjoin(resultingprofiles, emissions, on="Time")
+
+    return resultingprofilesEM
+end
+
+# Method for adding certain columns to the resulting profiles dataframe
+
+function addcolumnstoresultingprofiles(
+    resultingprofiles
+)
+    # Establishing which columns we need to add
+    costs = ["grid_cost_fraction", "RES_fraction", "electrolyzer_fraction", "storage_system_fraction"]
+    lcohcolumns = ["grid_cost_LCOH", "RES_LCOH", "electrolyzer_LCOH", "storage_system_LCOH"]
+    # We need
+    for (cost, lcoh) in zip(costs, lcohcolumns)
+        resultingprofiles[:, lcoh] = resultingprofiles[:, cost] .* resultingprofiles[:, "LCOH"]
+    end
+    return resultingprofiles
+end
+
+fullscenariosNL[:, "RES_fraction"] + fullscenariosNL[:, "electrolyzer_fraction"] + fullscenariosNL[:, "storage_system_fraction"] + fullscenariosNL[:, "grid_cost_fraction"]

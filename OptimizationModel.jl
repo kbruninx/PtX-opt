@@ -12,24 +12,18 @@ The first version consists of:
 =#
 
 # Importing the necessary packages
-using JuMP
-using Gurobi
-using PyCall
-using CSV
-using DataFrames
-using JSON
-using ReusePatterns
-using Statistics
-using StatsBase
-using CairoMakie
-using Tables
-using LinearAlgebra
-using Dates
+using JuMP, Gurobi, Clp # Optimization packages
+using DataFrames, LinearAlgebra, Tables # Data packages
+using Dates, ReusePatterns, Setfield # Utility packages
+using Random, Distributions, StatsBase, Statistics # Statistics packages
+using FileIO, JSON, CSV, JLD2 # File handling packages
+using CairoMakie # Plotting packages
 CairoMakie.activate!(type = "png")
 
 # Directory
 const home_dir = @__DIR__
 
+year = 2020
 
 # Useful structures
 struct Scenario_Data
@@ -39,10 +33,11 @@ struct Scenario_Data
     lambda_TSO::Float64 # TSO penalty factor
     # Hydrogen target
     hourly_target::Float64 # kg/h of hydrogen production
-    no_etc_periods::Int64 #number of hours per electricity temporal correlation period
+    no_etc_periods::Union{Int64, Nothing} #number of hours per electricity temporal correlation period
     no_htc_periods::Int64 #number of hours per hyrdogen temporal correlation period
     MPLDSP::Float64 #Minimum partial load of the DSP
     CFDSP::Float64 #Capacity factor of the DSP
+    EI_limit::Union{Float64, Nothing} #Upper bound of the emission intensity in gCO2/kgH2
     # Cap on combined generation capacity
     maxcapgeneration::Number
 end
@@ -96,11 +91,12 @@ end
 
 struct Timeseries_Data
     # Timeseries data structure, containing all the timeseries data needed for the optimization model
-    solar::Array{Float64,1}
-    wind_on::Array{Float64,1}
-    wind_off::Array{Float64,1}
-    price_DAM::Array{Float64,1}
-    decision::Array{Float64,1}
+    solar::Vector{Float64}
+    wind_on::Vector{Float64}
+    wind_off::Vector{Float64}
+    price_DAM::Vector{Float64}
+    EI::Vector{Float64}
+    representativedaysarray::Vector{Int64}
     ordering::Array{Float64,2}
 end
 
@@ -151,11 +147,11 @@ Base.show(io::IO, s::Compressor_Data) = print(io, "Compressor Data:
 )
 
 Base.show(io::IO, t::Timeseries_Data) = print(io, "Timeseries Data:
-    Solar capacity factor mean = $(mean(t.solar)),
-    Onshore wind capacity factor mean =  $(mean(t.wind_on)),
-    Offshore wind capacity factor mean =  $(mean(t.wind_off)),
-    Price DAM mean= $(mean(t.price_DAM)),
-    Representative days = $(size(t.ordering,1)) == $(length(t.decision)) == $(round(Int64, length(t.price_DAM)/24)),
+    Solar capacity factor mean = $(mean(t.solar, weights(repeat(decisionarray(t.ordering), inner=24))))
+    Onshore wind capacity factor mean =  $(mean(t.wind_on, weights(repeat(decisionarray(t.ordering), inner=24)))),
+    Offshore wind capacity factor mean =  $(mean(t.wind_off, weights(repeat(decisionarray(t.ordering), inner=24)))),
+    Price DAM mean= $(mean(t.price_DAM, weights(repeat(decisionarray(t.ordering), inner=24)))),
+    Representative days = $(size(t.ordering,1)) == $(length(decisionarray(t.ordering))) == $(round(Int64, length(t.price_DAM)/24)),
     Total days = $(size(t.ordering,2))"
 )
 
@@ -184,21 +180,21 @@ function fetchparameterdata(
         )
     # If there are multiple scenarios, and no sensitivity analysis, return a DataFrame with the Parameter_Data structs
     elseif scenarios isa DataFrame && components isa Dict
-        parameterdata = select(scenarios, Not("Scenario"))
-        parameterdata[:, "Parameters"] = [Parameter_Data(
+        parameterdata = select(scenarios, Not("scenario"))
+        parameterdata[:, "parameters"] = [Parameter_Data(
             scenario,
             components,
             timeseries
-            ) for scenario in scenarios[:, "Scenario"]]
+            ) for scenario in scenarios[:, "scenario"]]
         return parameterdata
     # If there is a sensetivity analysis, and only one scenario, return a DataFrame with the Parameter_Data structs
     elseif scenarios isa Scenario_Data && components isa DataFrame
-        parameterdata = select(components, Not("ComponentData"))
-        parameterdata[:, "Parameters"] = [Parameter_Data(
+        parameterdata = select(components, Not("component_data"))
+        parameterdata[:, "parameters"] = [Parameter_Data(
             scenarios,
             case,
             timeseries
-            ) for case in components[:, "ComponentData"]]
+            ) for case in components[:, "component_data"]]
         return parameterdata
     else
         error("This type of data entry is currently not supported")
@@ -210,10 +206,10 @@ function combinecomponents(
     components::Dict
 )
     componentscenarios = DataFrame(
-        "Component"=> String[], 
-        "Variable" => String[], 
-        "Adjustment" => Float64[],
-        "ComponentData" => Dict{String, Any}[]
+        "component"=> String[], 
+        "variable" => String[], 
+        "adjustment" => Float64[],
+        "component_data" => Dict{String, Any}[]
     )
     if sensitivity["variables"] isa Bool
         if sensitivity["variables"] == false
@@ -244,6 +240,7 @@ end
 function permutate(
     dict::Dict{String, Any}
 )
+    # 
     return [Dict{String,Any}(zip(keys(dict), p)) for p in Iterators.product(values(dict)...)]
 end
 
@@ -258,10 +255,18 @@ function permutatescenarios(
     end
     #Take out the name of scenario and permutate the rest
     name = pop!(dict, "name")
+
+    notvars = [(key, value) for (key,value) in dict if isnothing(value)]
+    for varvalue in notvars
+        delete!(dict, varvalue[1])
+    end
     permutations = permutate(dict)
     #Put the name back in
     for p in permutations
         p["name"] = name
+        for varvalue in notvars
+            p[varvalue[1]] = varvalue[2]
+        end
     end
     return permutations, varsofinterest
 end
@@ -278,7 +283,7 @@ function combinescenarios(
     end
 
     #Initialize the DataFrame
-    df = DataFrame([columnname => [] for columnname in [varsofinterest..., "Scenario"]])
+    df = DataFrame([columnname => [] for columnname in [varsofinterest..., "scenario"]])
     #Fill the DataFrame
     for p in scenarios
         push!(df, ([p[var] for var in varsofinterest]..., scenariofromdict(p)))
@@ -296,6 +301,7 @@ function scenariofromdict(dict)
         dict["no_htc_periods"],
         dict["MPLDSP"],
         dict["CFDSP"],
+        dict["EI_limit"],
         dict["maxcapgeneration"]
     )
 end
@@ -336,12 +342,24 @@ function timeseriesfromdict(
     timeseries_df = CSV.read(joinpath(home_dir, timeseriesfiles["profiles"]), DataFrame)
     ordering = transpose(CSV.File(joinpath(home_dir, timeseriesfiles["ordering"])) |> Tables.matrix)
     return Timeseries_Data(
-        [timeseries_df[:, series] for series in ["Solar", "WindOnshore", "WindOffshore", "Price"]]...,
-        Vector(vec(sum(ordering, dims=2))),
+        [timeseries_df[:, series] for series in ["Solar", "WindOnshore", "WindOffshore", "Price", "EI"]]...,
+        unique(timeseries_df[:, "period"]),
         ordering
         )
 end
 
+function datetimefromrepdays(
+    repdays::Vector{Int64}
+)
+    return [(DateTime(year, 1, 1, hour) +Dates.Day(day-1)) for day in repdays for hour in 0:23]
+end
+
+function datetimewholeyear(
+    year::Int64=2020,
+    numberofdays::Int64=365
+)
+    return [(DateTime(year, 1, 1, hour) +Dates.Day(day-1)) for day in 1:numberofdays for hour in 0:23]
+end
     #Financial calculations
 
 function getcapitalrecoveryfactor(
@@ -426,13 +444,13 @@ function ext_to_rep(
 
 )
     #We first reshape the extended values to a matrix of 24 columns and as many rows as there are total days
-    extarray = reshape(extvals, 24, length(extvals)÷24)'
-    display(extarray)
+    extarray = reshape(extvals, 24, length(extvals)÷24)
     #We then perform a matrix division which will yield a matrix with 24 columns and as many rows as there are representative days, 
-    reparray = \(ordering, extarray)
+    reparray = extarray/ordering
     # In order to flatten to a vector, we need to transpose the matrix first, because Julia flattens columnwise
-    out=vec(transpose(reparray))
-    return Vector{Float64}(out)
+    out=vec(reparray)    
+    display(out)
+    return out
 end
 
 # Transforms an array of representative values to an array of hourly values over the year based on an ordering matrix
@@ -485,15 +503,45 @@ function periodsarray(
     end
 end
 
-function storage_control(h_flows, ordering)
-    for i in eachindex(hflows[:h_storage_soc])
-        @assert (
-            isapprox(
-                hflows[:h_storage_soc][i], 
-                (hflows[:h_storage_soc][i-1] + hflows[:h_storage_in][i] - hflows[:h_storage_out][i])
-            )
-        )
+function normalizerows(
+    matrix
+)
+    rowmatrix = repeat(sum(matrix, dims=1), size(matrix, 1), 1)
+    matrix = matrix./rowmatrix
+    return matrix
+end
+
+function orderingshuffle(
+    ordering,
+    std;
+    it=100
+)
+    mean = 1
+    lb, ub = 0, mean*2
+    d = Truncated(Normal(mean, std*mean), lb, ub)
+    shuffle = rand(d, size(ordering))
+    for i in 1:it
+        ordering = shuffle .* ordering
     end
+    return normalizerows(ordering)
+end
+
+function extracttimeseriesdata(
+    timeseries:: Timeseries_Data
+)
+    toi = (timeseries.solar, timeseries.wind_on, timeseries.wind_off, timeseries.price_DAM)
+    return (
+        mean(
+            ts, 
+            weights(repeat(decisionarray(timeseries.ordering), inner=24))) 
+        for ts in toi
+    )
+end
+
+function decisionarray(
+    ordering::AbstractMatrix
+)
+    return vec(sum(ordering, dims=2))
 end
 
 """
@@ -535,6 +583,7 @@ function solveoptimizationmodel(
     no_htc_periods = scenario.no_htc_periods # Number of periods for the hydrogen temporal correlation
     MPLDSP = scenario.MPLDSP # Minimum Partial Load of the DSP
     CFDSP = scenario.CFDSP # Capacity factor of the DSP
+    EI_limit = scenario.EI_limit # Maximum EI in gCO2/kgH2
     lambda_TSO = scenario.lambda_TSO # Tariff for energy purchased from the grid
 
     components = parameters.components
@@ -543,16 +592,18 @@ function solveoptimizationmodel(
     compressor = components["compressor"]
     
     timeseries = parameters.timeseries # Timeseries data object
-    decision_array = repeat(timeseries.decision, inner=24) # Array of weights for the representative days
+    decision_array = repeat(decisionarray(timeseries.ordering), inner=24) # Array of weights for the representative days
     representative_days = size(timeseries.ordering, 1) # Number of representative days
     representative_timesteps = representative_days*24 # Number of timesteps in the representative days
     total_days = size(timeseries.ordering, 2) # Number of days in the total timeseries
     total_timesteps = total_days*24  # Number of timesteps in the total timeseries
+    total_production = hourly_target*total_timesteps # Total hydrogen production in kg
 
     htc_isdaily = false#(no_htc_periods<=total_days) # Boolean for daily hydrogen temporal correlation, speed ups are iMPLDSPemented if true
     htc_periods = periodsarray(no_htc_periods, daysintotal=total_days, daily=htc_isdaily) # Array with the periods for the hydrogen temporal correlation
     etc_isdaily = false#(no_etc_periods<=total_days) # Boolean for daily electrical temporal correlation, speed ups are iMPLDSPemented if true
-    etc_periods = periodsarray(no_etc_periods, daysintotal=total_days, daily=etc_isdaily) # Array with the periods for the electrical temporal correlation
+
+    if !isnothing(no_etc_periods) etc_periods = periodsarray(no_etc_periods, daysintotal=total_days, daily=etc_isdaily) end# Array with the periods for the electrical temporal correlation
 
     hourlymatching = (no_etc_periods==8760) # Boolean for hourly matching, speed ups are iMPLDSPemented if true
 
@@ -611,26 +662,28 @@ function solveoptimizationmodel(
         )
     end
 
-    # Defining the net consumption as the power bought, minus all the power sold and used for non-electrolyis purposes
-    netconsumption_rep = [
-        p_DAM_buy[t] - (
-            p_DAM_sell[t] +
-            p_compressor[t] +
-            ((1 - os_electrolyzer[t]) * (electrolyzer.P_standby * c_electrolyzer)))
-        for t in 1:representative_timesteps
-    ]
+    if !isnothing(no_etc_periods)
+        # Defining the net consumption as the power bought, minus all the power sold and used for non-electrolyis purposes
+        netconsumption_rep = [
+            p_DAM_buy[t] - (
+                p_DAM_sell[t] +
+                p_compressor[t] +
+                ((1 - os_electrolyzer[t]) * (electrolyzer.P_standby * c_electrolyzer)))
+            for t in 1:representative_timesteps
+        ]
 
-    # Extending the net consumption to the total timeseries
-    netconsumption_ext = rep_to_ext(netconsumption_rep, timeseries.ordering, daily=etc_isdaily)
+        # Extending the net consumption to the total timeseries
+        netconsumption_ext = rep_to_ext(netconsumption_rep, timeseries.ordering, daily=etc_isdaily)
 
-        #Temporal correlation constraint
-    @constraint(
-        basemodel, 
-        etc_con[period in etc_periods], 
-        (sum(
-             netconsumption_ext[t]
-        for t in period) <= 0)
-    )
+            # Electrical temporal correlation constraint
+        @constraint(
+            basemodel, 
+            etc_con[period in etc_periods], 
+            (sum(
+                netconsumption_ext[t]
+            for t in period) <= 0)
+        )
+    end
     
         # Number of upper bounds on variables that increase the basemodel speed
             # Upper bound electrolyzer capacity, which should never exceed the max rated power of the RES
@@ -761,6 +814,15 @@ function solveoptimizationmodel(
         length(htc_periods[period])*hourly_target)
     )
 
+    if !isnothing(EI_limit)
+        # Emission intensity constraint
+        @constraint(
+            basemodel,
+            emission_con,
+            (sum(decision_array[t]*p_DAM_buy[t]*timeseries.EI[t] for t in 1:representative_timesteps)/total_production <= 0.001*EI_limit)
+        )
+    end
+
     # Defining the objective function
     @objective(
         basemodel, 
@@ -791,7 +853,7 @@ function getopportunity(
     components = parameters.components
     timeseries = parameters.timeseries
 
-    decision_array = repeat(timeseries.decision, inner=24)
+    decision_array = repeat(decisionarray(timeseries.ordering), inner=24)
     representative_timesteps = size(timeseries.ordering, 1)*24
 
     # Defining the model
@@ -867,7 +929,7 @@ This function returns the results of the optimization model.
 function getresults(
     model::JuMP.Model, 
     parameters::Parameter_Data;
-    verbose::Bool,
+    verbose::Bool=false,
     opportunitycost::Number = 0
 )
     if termination_status(model) == MOI.INFEASIBLE
@@ -882,90 +944,133 @@ function getresults(
     var_data = getresultsdict(model)
     total_days = size(parameters.timeseries.ordering, 2)
     total_timesteps = total_days*24
-    decision_array = repeat(parameters.timeseries.decision, inner=24)
-    ordering = parameters.timeseries.ordering
+    decision_array = repeat(decisionarray(parameters.timeseries.ordering), inner=24)
+    timeseries = parameters.timeseries
+    ordering = timeseries.ordering
+    price_DAM = timeseries.price_DAM
 
-    capacitycomponentpairs_RES = zip(
-        (var_data[char] for char in (:c_solar, :c_wind_on, :c_wind_off)),
-        (parameters.components[component] for component in ("solar", "wind_on", "wind_off"))
-    )
-    capacitycomponentpairs_H = zip(
-        (var_data[char] for char in (:c_electrolyzer, :c_storage, :c_compressor)),
-        (parameters.components[component] for component in ("electrolyzer", "storage", "compressor"))
-    )
-
-    # Preparing the data for plotting
-    p_solar = parameters.timeseries.solar*var_data[:c_solar]
-    p_wind_on = parameters.timeseries.wind_on*var_data[:c_wind_on]
-    p_wind_off = parameters.timeseries.wind_off*var_data[:c_wind_off]
-    p_electrolyzer = var_data[:p_electrolyzer]
-
-    p_compressor = var_data[:p_compressor]
-    p_DAM = parameters.timeseries.price_DAM
-    p_DAM_buy = var_data[:p_DAM_buy]
-    p_DAM_sell = var_data[:p_DAM_sell]
+    # Defining the variables for the timeseries
+    REScaps = (:c_solar, :c_wind_on, :c_wind_off)
+    RESpdict = Dict(:c_solar=>:p_solar, :c_wind_on=>:p_wind_on, :c_wind_off=>:p_wind_off)
+    REScf = (timeseries.solar, timeseries.wind_on, timeseries.wind_off)
+    pchars = (:p_electrolyzer, :p_compressor, :p_DAM_buy, :p_DAM_sell)
+    Hcaps = (:c_electrolyzer, :c_storage, :c_compressor)
+    hchars = (:h_electrolyzer, :h_storage_in, :h_storage_out, :h_demand, :h_demand_dir)
 
     netconsumption = (
-        p_DAM_buy .- (
-            p_DAM_sell .+
-            p_compressor .+
+        var_data[:p_DAM_buy] .- (
+            var_data[:p_DAM_sell] .+
+            var_data[:p_compressor] .+
             ((1 .- var_data[:os_electrolyzer]) .* (parameters.components["electrolyzer"].P_standby * var_data[:c_electrolyzer])))
     )
 
-    power_data = DataFrame(
-        :p_solar => p_solar,
-        :p_wind_on => p_wind_on,
-        :p_wind_off => p_wind_off,
-        :p_electrolyzer => p_electrolyzer,
-        :p_compressor => p_compressor,
-        :p_DAM_buy => p_DAM_buy,
-        :p_DAM_sell => p_DAM_sell,
-        :netconsumption => netconsumption
+    # Creating the timeseries dataframe
+    timeseries_data = Dict()
+    
+    timeseries_data[:repdata] = DataFrame(
+        merge(
+            Dict(:datetime => datetimefromrepdays(timeseries.representativedaysarray)),
+            # Dict with RES data
+            Dict(RESpdict[REScap] => (ts*var_data[REScap]) for (ts, REScap) in zip(REScf, REScaps)),
+            # Dict with other power data
+            Dict(pchar => var_data[pchar] for pchar in pchars),
+            # Dict with net consumption
+            Dict(:netconsumption => netconsumption),
+            # Dict with hydrogen data
+            Dict(hchar => var_data[hchar] for hchar in hchars),
+            # Dict with the day-ahead price
+            Dict(:price_DAM => timeseries.price_DAM),
+            # Dict with the emission data
+            Dict(:EI => timeseries.EI, :attremissions => var_data[:p_DAM_buy].*timeseries.EI),
+            # Dict with decision_array
+            Dict(:decision_array => decision_array)
+        )
+    )
+    timeseries_data[:extdata] = DataFrame(
+        :datetime => datetimewholeyear(year, total_days),
+        # Hydrogen storage state of charge
+        :h_storage_soc => var_data[:h_storage_soc],
     )
 
-    hydrogen_data = DataFrame(
-        :h_electrolyzer => rep_to_ext(var_data[:h_electrolyzer],ordering),
-        :h_storage_in => rep_to_ext(var_data[:h_storage_in],ordering),
-        :h_storage_out => rep_to_ext(var_data[:h_storage_out], ordering),
-        :h_demand => rep_to_ext(var_data[:h_demand], ordering),
-        :h_demand_dir => rep_to_ext(var_data[:h_demand_dir], ordering),
-        :h_storage_soc => var_data[:h_storage_soc]
+    capacitycomponentpairs_RES = zip(
+        (var_data[char] for char in REScaps),
+        (parameters.components[component] for component in ("solar", "wind_on", "wind_off"))
+    )
+    capacitycomponentpairs_H = zip(
+        (var_data[char] for char in Hcaps),
+        (parameters.components[component] for component in ("electrolyzer", "storage", "compressor"))
     )
 
     total_cost = objective_value(model)-opportunitycost
-    total_revenue_DAM = sum(decision_array.*(p_DAM_sell.*p_DAM.-(p_DAM_buy.*(p_DAM.+parameters.scenario.lambda_TSO))))
+    total_production = (parameters.scenario.hourly_target*total_timesteps)
+    total_cost_DAM = sum(decision_array.*((var_data[:p_DAM_buy].*(price_DAM.+parameters.scenario.lambda_TSO)) .- var_data[:p_DAM_sell].*price_DAM))
+    total_emissions = sum(decision_array.*var_data[:p_DAM_buy].*timeseries.EI)
     capital_cost_RES = sum(getcomponentcosts(capacity, parameters.scenario, component) for (capacity, component) in capacitycomponentpairs_RES)
-    RES_residual_factor = (capital_cost_RES-total_revenue_DAM-opportunitycost)/capital_cost_RES
+    adjusted_cost_RES = (capital_cost_RES+total_cost_DAM-opportunitycost)
+    RES_residual_factor = adjusted_cost_RES/capital_cost_RES
+    LCOH = (total_cost)/total_production
+    EI_H = total_emissions/total_production
 
     # Extracting outcomes
-    outcome_data = Dict{String, Union{Float64, Dict{String, Float64}}}(
-        "Total costs" => total_cost,
-        "Unadjusted costs" => objective_value(model),
-        "Average cost of Hydrogen" => (total_cost)/(parameters.scenario.hourly_target*total_timesteps),
-        "Unadjusted average cost of Hydrogen" => objective_value(model)/(parameters.scenario.hourly_target*total_timesteps),
-        "Electrolyzer capacity factor" => mean((var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), weights(decision_array)),
-        "Total revenue grid" => total_revenue_DAM 
+    FinancialDict = Dict(
+        #Manual calculations
+        "total_cost" => total_cost,
+        "LCOH" => LCOH,
+        "LCOH(unadjusted)" => objective_value(model)/(parameters.scenario.hourly_target*total_timesteps),
+        "electrolyzer_cf" => mean((var_data[:p_electrolyzer]./var_data[:c_electrolyzer]), weights(decision_array)),
+        "grid_cost" => total_cost_DAM,
+        "grid_cost_fraction" => total_cost_DAM/total_cost,
+        "grid_cost_LCOH" => total_cost_DAM/total_production,
+        "total_emissions" => total_emissions,
+        "EI_H" => EI_H,
+        "AAC" => (LCOH-1.15)/(9.28-EI_H),
+        "RES_capex_LCOH" => capital_cost_RES/total_production,
+        "RES_cost" => adjusted_cost_RES,
+        "RES_fraction" => adjusted_cost_RES/total_cost,
+        "opportunity_cost" => opportunitycost,
     )
 
     println("opportunitycost: ", opportunitycost)
-
-    for (capacity, component) in capacitycomponentpairs_RES
-        adjustedcost = getcomponentcosts(capacity, parameters.scenario, component)*RES_residual_factor
-        outcome_data["$(name(component))"] = Dict(
-            "capacity"=> capacity, 
-            "cost" => adjustedcost, 
-            "fraction" => adjustedcost/total_cost
-        )
-    end
     
-    for (capacity, component) in capacitycomponentpairs_H
-        outcome_data["$(name(component))"] = Dict(
-            "capacity"=> capacity, 
-            "cost" => getcomponentcosts(capacity, parameters.scenario, component), 
-            "fraction" => getcomponentcosts(capacity, parameters.scenario, component)/total_cost
+    RESDict = Dict()
+    for (capacity, component) in capacitycomponentpairs_RES
+        capex = getcomponentcosts(capacity, parameters.scenario, component)
+        adjustedcost = capex*RES_residual_factor
+        merge!(
+            RESDict,
+            Dict(
+                "$(name(component))_capacity"=> capacity, 
+                "$(name(component))_cost" => adjustedcost, 
+                "$(name(component))_capex" => capex, 
+                "$(name(component))_capex_LCOH" => capex/total_production, 
+                "$(name(component))_fraction" => adjustedcost/total_cost,
+                "$(name(component))_LCOH" => adjustedcost/total_production
+            )
         )
     end
 
+    HDict = Dict()
+    for (capacity, component) in capacitycomponentpairs_H
+        capex = getcomponentcosts(capacity, parameters.scenario, component)
+        merge!(
+            HDict,
+            
+            Dict(
+                "$(name(component))_capacity"=> capacity, 
+                "$(name(component))_cost" => capex, 
+                "$(name(component))_fraction" => capex/total_cost,
+                "$(name(component))_LCOH" => capex/total_production
+            )
+        )
+    end
+
+    HDict["storage_system_cost"] = HDict["storage_cost"]+HDict["compressor_cost"]
+    HDict["storage_system_fraction"] = HDict["storage_system_cost"]/total_cost
+    HDict["storage_system_LCOH"] = HDict["storage_system_cost"]/total_production
+
+    println(HDict)
+
+    outcome_data = merge(FinancialDict, RESDict, HDict)
 
     # Printing the results if verbose
     if verbose
@@ -973,37 +1078,29 @@ function getresults(
     end
 
     return Dict(
-        :power_data => power_data,
-        :hydrogen_data => hydrogen_data,
-        :outcome_data => outcome_data
+        :outcome_data => outcome_data,
+        :timeseries_data => timeseries_data
     )
 end
 
-function savedata(
-    data::Dict{Any,Any},
-    parameters::Parameter_Data
-)
-    filename = "results_$(parameters.scenario.no_etc_periods)_$(Parameters.scenario.no_htc_periods)_$(parameters.scenario.MPLDSP).csv"
-    # Saving the results to a csv file
-    combined_data = hcat(data[:power_data], data[:hydrogen_data])
-    CSV.write(filename, combined_data)
-end
-
 function addoutcometodf(
-    results::DataFrame,
-    outcomes::Vector{Union{String}}
+    results::DataFrame;
+    outcomes::Vector{Any}=[]
 )
+    if isempty(outcomes)
+        outcomes = keys(results[4, :results][:outcome_data])
+    end
     for outcome in outcomes
         println("Adding outcome: $(outcome)")
         data=[]
-        for result in results[:, "Results"]
-            if result isa Dict{Symbol, Any}
+        for result in results[:, "results"]
+            if result isa AbstractDict
                 push!(data, result[:outcome_data][outcome])
             elseif  !(result isa Number) || isnan(result) 
                 push!(data, NaN)
             end
         end
-        dictdata = filter(t -> (typeof(t)==Dict{String, Float64}), data)
+        dictdata = filter(t -> (t isa AbstractDict), data)
         if !isempty(dictdata)
             for key in keys(dictdata[1])
                 insertcols!(results, "$(outcome)_$(key)" => [if typeof(datapoint)==Dict{String, Float64} datapoint[key] else datapoint end for datapoint in data])
@@ -1015,154 +1112,6 @@ function addoutcometodf(
     return results
 end
 
-function makeplot(
-    flows::Array{Array{Float64,1},1},
-    labels::Array{String,1};
-    twindata::Union{Array{Float64,1}, Bool}=false,
-    twinlabel::String="",
-    subsetsize::Union{Int64, Bool}=false
-)
-    # Removing the flows and labels that are all zeros
-    zeros = findall(x->iszero(x), flows)
-    parsedflows = deleteat!(copy(flows), zeros)
-    parsedlabels = deleteat!(copy(labels), zeros)
-
-
-    # Taking flow subsets 
-    if subsetsize != false
-        start = 1#round(Int, length(flows[1])/2)
-        parsedflows = map(x->x[start:start+subsetsize-1], parsedflows)
-        if isa(twindata, Array)
-            twindata = twindata[1:subsetsize]
-        end
-    end
-
-    fig = Figure()
-
-    ax1 = Axis(fig[1,1])
-    series!(ax1, parsedflows, labels=parsedlabels)
-
-    # Adding legend
-    axislegend(ax1; position=:lt)
-
-    ax2 = Axis(fig[1,1], yaxisposition=:right)
-    hidespines!(ax2)
-    hidexdecorations!(ax2)
-
-    # Adding a twin axis if needed
-    if isa(twindata, Array)
-        lines!(ax2, twindata, label=twinlabel, color=:black, linestyle=:dash)
-        axislegend(ax2; position=:rt)
-        return fig, ax1, ax2
-    end
-
-
-    return fig, ax1, ax2
-end
-
-function powerfig(
-    powerflow::Array{Array{Float64,1},1},
-    powerlabels::Array{String,1};
-    twindata::Union{Array{Float64,1}, Bool}=false,
-    twinlabel::String="",
-    twinaxislabel::String="",
-    subsetsize::Union{Int64, Bool}=false
-)
-    fig, ax1, ax2 = makeplot(powerflow, powerlabels; twindata=twindata, twinlabel=twinlabel, subsetsize=subsetsize)
-    ax1.title = "Power flows"
-    ax1.ylabel ="Power [MW]"
-    ax1.xlabel = "Time [h]"
-    ax2.ylabel = twinaxislabel
-    return fig
-end
-
-function hydrogenfig(
-    hydrogenflow::Array{Array{Float64,1},1},
-    hydrogenlabels::Array{String,1};
-    twindata::Union{Array{Float64,1}, Bool}=false,
-    twinlabel::String="",
-    twinaxislabel::String="",
-    subsetsize::Union{Int64, Bool}=false
-)
-    fig, ax1, ax2 = makeplot(hydrogenflow, hydrogenlabels; twindata=twindata, twinlabel=twinlabel, subsetsize=subsetsize)
-    ax1.title = "Hydrogen flows"
-    ax1.ylabel ="Hydrogen massflow [kg]"
-    ax1.xlabel = "Time [h]"
-    ax2.ylabel = twinaxislabel
-    return fig
-end
-
-function makeplots(
-    data::Dict{Symbol,Any},
-    parameters::Parameter_Data;
-    days::Int64=4,
-    extended::Bool=false
-)
-    figs = Dict{Symbol, Any}()
-    power_data = data[:power_data]
-    hydrogendata = data[:hydrogen_data]
-
-    subsetsize = days*24
-    # Collecting all the power data
-    powerlabels = ["Solar", "Wind (onshore)", "Wind (offshore)", "Buy", "Sell", "Electrolyzer", "Compressor"]
-    powerflow = [power_data[:, datapoint] for datapoint in [:p_solar, :p_wind_on, :p_wind_off, :p_DAM_buy, :p_DAM_sell, :p_electrolyzer, :p_compressor]]
-    price_DAM = parameters.timeseries.price_DAM
-
-    # Collecting all the hydrogen data
-    hydrogenlabels = ["Electrolyzer", "Storage in", "Storage out", "Direct", "Demand"]
-    hydrogenflow = [hydrogendata[:, datapoint] for datapoint in [:h_electrolyzer, :h_storage_in, :h_storage_out, :h_demand_dir, :h_demand]]
-    hsoc = hydrogendata[:, :h_storage_soc]
-
-    # Plotting the flows
-    figs[:pfig] = powerfig(powerflow, powerlabels, twindata=price_DAM, twinlabel="DAM Price", twinaxislabel="DAM price [€/MWh]", subsetsize=subsetsize)
-    figs[:hfig] = hydrogenfig(hydrogenflow, hydrogenlabels; twindata=hsoc, twinlabel="Storage SOC", twinaxislabel="Storage SOC [kg]", subsetsize=subsetsize)
-    
-
-
-    # Simple plots
-    figs[:pfig_simple] = power
-    
-
-    figs[:hfig_full] = hydrogenfig(hydrogenflow, hydrogenlabels; twindata=hsoc, twinlabel="Storage SOC", twinaxislabel="Storage SOC [kg]")
-
-
-    return figs
-end
-
-function make3dplot(
-    results::DataFrame
-)
-    X = convert(Array{Float32,1}, results[:, :no_etc_periods])
-    Y = convert(Array{Float32,1}, 100*results[:, :MPLDSP])
-    Z = convert(Array{Float32,1}, results[:, :no_htc_periods])
-
-    C = [convert(Float32, x) for x in (results[:, :LCOH])]
-
-    fig = Figure()
-    ax1=Axis3(fig[1, 1], aspect=(1,1,1), azimuth = pi/4.8,elevation=pi/6)
-
-    plt1 = scatter!(X, Y, Z, markersize=20, label="Scenario", color=C)
-    Colorbar(fig[1,2], plt1, label="LCOH [€/kg]")
-    
-    ax1.xlabel="ETC length (h)"
-    ax1.ylabel="MPL (%)"
-    ax1.zlabel="HTC length (h)"
-    ax1.title="LCOH"
-    fig
-end
-
-#Unfinished function
-function plotsensitivity(
-    results::DataFrame;
-    normalized::Bool=true,
-    LCXY::Array{Char, 1}=["Variable", "Component", "Adjustment", "LCOH"]
-)
-    L = unique(results[LCXY[1]])
-    C = []
-    C = [[component[LCXY[4]]]]
-    X=sort(unique(results[X]))
-
-end
 
 """
     plotheatmap(
@@ -1290,13 +1239,32 @@ end
 function saveresults(
     results::DataFrame,
     savepath::String,
-    savecsv::Bool
+    parameters::Parameter_Data
     )
-    if savecsv
-        addoutcometodf(results, string.(collect(keys(results[1, :Results][:outcome_data]))))
-        writeable = select(results, Not("Results"))
-        CSV.write("$(savepath)/variabledata_$(Dates.format(now(), "mmddTHHMM")).csv", writeable)    
-    end
+    writeable = select(results, Not("results"))
+    CSV.write("$(savepath)/variabledata_$(Dates.format(now(), "mmddTHHMM")).csv", writeable)
+end
+
+function saveresults(
+    results::Dict,
+    savepath::String,
+    parameters::Parameter_Data
+    )
+    timedict = Dict(
+        1 => "Y",
+        4 => "Q",
+        12 => "M",
+        26 => "bW",
+        52 => "W",
+        365 => "D",
+        8760 => "H"
+    )
+    scenario = "$(timedict[parameters.scenario.no_etc_periods])$(timedict[parameters.scenario.no_htc_periods])$(round(Int64,(parameters.scenario.MPLDSP*100)))"
+    open("$(savepath)/timeseriesdata_$(scenario)_$(Dates.format(now(), "mmddTHHMM")).csv", "w") do f
+        JSON.print(f,results[:outcome_data]) 
+    end    
+    CSV.write("$(savepath)/timeseriesrepdata_$(scenario)_$(Dates.format(now(), "mmddTHHMM")).csv", results[:timeseries_data][:repdata])
+    CSV.write("$(savepath)/timeseriesextdata_$(scenario)_$(Dates.format(now(), "mmddTHHMM")).csv", results[:timeseries_data][:extdata])
 end
 
 """
@@ -1327,18 +1295,17 @@ function optimizeptx(
     parameters::Parameter_Data;
     verbose::Bool=true,
     savepath::String="$(home_dir)/Results",
-    savecsv::Bool=true,
     opportunity::Bool=true
 )
     if verbose
         println("Parameters: ", parameters)
     end
-    solvedmodel = solveoptimizationmodel(parameters, 1600, 0.01)
-    if verbose
-        println("Opportunity is $(opportunity)")
-    end
+    solvedmodel = solveoptimizationmodel(parameters, 4000, 0.05)
     if opportunity
         opportunitycost = getopportunity(parameters)
+        if opportunitycost>0
+            throw(ArgumentError("Opportunity cost is positive: $(opportunitycost)"))
+        end
     end
     if termination_status(solvedmodel) == MOI.OPTIMAL
         println("Optimal solution found.")
@@ -1370,24 +1337,26 @@ function optimizeptx(
     parameterdf::DataFrame;
     verbose::Bool=true,
     savepath::String="$(home_dir)/Results",
-    savecsv::Bool=true,
     opportunity::Bool=true
 )
     if verbose
         println("Parameters: ", parameterdf)
     end
-    solutiondataframe = select(parameterdf, Not("Parameters"))
+    solutiondataframe = select(parameterdf, Not("parameters"))
     results = []
-    if opportunity
-        opportunitycost = getopportunity(parameterdf[1, "Parameters"])
-    end
-    for (i, parameters) in enumerate(parameterdf[:, "Parameters"])
+    for (i, parameters) in enumerate(parameterdf[:, "parameters"])
         println("
-        At $i / $(length(parameterdf[:,"Parameters"]))
+        At $i / $(length(parameterdf[:,"parameters"]))
         ETC periods: $(parameters.scenario.no_etc_periods)
         HTC periods: $(parameters.scenario.no_htc_periods) 
         MPL: $(parameters.scenario.MPLDSP)")
-        solvedmodel = solveoptimizationmodel(parameters, 1200, 0.05)
+        solvedmodel = solveoptimizationmodel(parameters, 4000, 0.05)
+        if opportunity
+            opportunitycost = getopportunity(parameters)
+            if opportunitycost>0
+                throw(ArgumentError("Opportunity cost is positive: $(opportunitycost)"))
+            end
+        end
         push!(
             results,
             getresults(
@@ -1397,11 +1366,38 @@ function optimizeptx(
                 opportunitycost=opportunitycost)
         )
     end
-    solutiondataframe[:, "Results"] = results
-    if savecsv
-        saveresults(solutiondataframe, savepath, savecsv)
-    end
+    solutiondataframe[:, "results"] = results
     return solutiondataframe
+end
+
+function shufflescript(
+    parameters::Parameter_Data,
+    shuffles::Int64;
+    verbose::Bool=true,
+    std=0.25
+)
+
+    # Initiating dataframe to hold the results
+    outcomedf = DataFrame(
+        :CFsolar => [],
+        :CFwind_on => [],
+        :CFwind_off => [],
+        :DAM => [],
+        :Ordering => []
+    )
+    baseordering = copy(parameters.timeseries.ordering)
+    for i in 1:shuffles
+        println("Shuffle $i")
+        # Shuffling the timeseries
+        parameters = @set parameters.timeseries.ordering = orderingshuffle(baseordering, std)
+        # Optimizing the model
+        #result = optimizeptx(parameters, verbose=verbose, savecsv=false)
+
+        delta = sum(abs.(parameters.timeseries.ordering-baseordering))
+        # Adding the results to the dataframe
+        push!(outcomedf, (extracttimeseriesdata(parameters.timeseries)..., parameters.timeseries.ordering))
+    end
+    return outcomedf
 end
 
 
@@ -1410,17 +1406,17 @@ function mainscript(
     verbose::Bool=true;
     savepath::String="$(home_dir)/Results",
     savecsv::Bool=false,
+    savejld::Bool=true,
     opportunity::Bool=true
 )   
     parameters = fetchparameterdata(parameterfilename)
-    results = optimizeptx(parameters, verbose=verbose, savepath=savepath, savecsv=savecsv, opportunity=opportunity)
-    if results isa JuMP.Model
-        return results
-    elseif parameters isa Parameter_Data
-        plots = makeplots(results, parameters, extended=false)
-        return results, plots
-    else
-        return results
+    results = optimizeptx(parameters, verbose=verbose, savepath=savepath, opportunity=opportunity)
+    if savecsv
+        saveresults(results, savepath, parameters)
     end
+    if savejld
+        save_object("$(savepath)/results_$(Dates.format(now(), "mmddTHHMM")).jld2", results)
+    end
+    return results
 end
 
